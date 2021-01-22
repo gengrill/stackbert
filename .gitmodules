@@ -1,0 +1,6 @@
+[submodule "dwarf_import"]
+	path = dwarf_import
+	url = https://github.com/gengrill/dwarf_import
+[submodule "pyelftools"]
+	path = pyelftools
+	url = https://github.com/gengrill/pyelftools
