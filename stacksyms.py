@@ -7,11 +7,42 @@ from pygdbmi.gdbcontroller import GdbController
 from elftools.elf.elffile import ELFFile
 
 # from https://github.com/Vector35/dwarf_import
+from dwarf_import.model.elements import LocationType
 from dwarf_import.io.dwarf_expr import ExprEval, LocExprParser
 from dwarf_import.io.dwarf_import import create_module_from_ELF_DWARF_file
 
 def newParseDWARF(debugFilepath):
     return create_module_from_ELF_DWARF_file(debugFilepath)
+
+def newGenerateDebugLabel(func):
+    label = func.name + "@" + hex(func.frame_base)
+    stackVars = filter(func.variables, isOnStack)
+#                print(hex(loc.begin) + " to " + hex(loc.end) + ": " \
+#                      + str(loc.type)[13:] + str(loc.expr))
+
+def isOnStack(variable):
+    if variable.type == LocationType.STATIC_GLOBAL:
+        return not isInReg(variable)
+    return 
+
+def isInReg(variable):
+    return False
+
+def generateDebugLabel(functionName, functions):
+    stackElements = []
+    for stackElement in functions[functionName].keys():
+        if 'offset' in functions[functionName][stackElement]:
+            off  = functions[functionName][stackElement]['offset'][-1][1] # TODO: only looks at last offset
+            size = functions[functionName][stackElement]['size']
+            stackElements += [(stackElement, size, off)]
+    return sorted(stackElements,key=lambda se : se[2])
+
+def generateLabel(functionName, functions):
+    return list(map(lambda x : x[1], generateDebugLabel(functionName, functions)))
+
+def generateFeature(functionName, functions):
+    ops = map(lambda x : x[1].replace(' ', ''), functions[functionName]['disas'])
+    return 'START '+' '.join(ops)+' END'
 
 DW_GLO = 'DW_TAG_base_type'
 DW_FUN = 'DW_TAG_subprogram'
@@ -76,33 +107,30 @@ def _collectLocals(gdbOutput, funcDict):
 def _collectDisas(gdbOutput, funcDict):
     funcDict['disas'] = [tuple(line.strip().split('\\t')) for line in gdbOutput[1:-1]]
 
+def _queryGDB(gdbmi, gdbCmd):
+    result = gdbmi.write(gdbCmd)
+    return [msg['payload'] for msg in result if msg['type']=='console']
+
 def staticGDB(debugFilepath, functions):
     """Obtains additional info about stack variables from GDB (w/o running the binary)."""
     logging.info("Loading file %s statically in GDB." % debugFilepath)
     gdbmi  = GdbController()
     result = gdbmi.write('file ' + debugFilepath)
     for func in functions.keys():
-        result = gdbmi.write('info scope ' + func)
-        result = [msg['payload'] for msg in result if msg['type']=='console']
-        _collectLocals(result, functions[func])
-        result = gdbmi.write('disas /r ' + func)
-        result = [msg['payload'] for msg in result if msg['type'] == 'console']
-        _collectDisas(result, functions[func])
+        _collectLocals(_queryGDB(gdbmi, 'info scope ' + func), functions[func])
+        _collectDisas(_queryGDB(gdbmi, 'disas /r ' + func), functions[func])
     gdbmi.exit()
     return functions
 
-def generateDebugLabel(functionName, functions):
-    stackElements = []
-    for stackElement in functions[functionName].keys():
-        if 'offset' in functions[functionName][stackElement]:
-            off  = functions[functionName][stackElement]['offset'][-1][1] # TODO: only looks at last offset
-            size = functions[functionName][stackElement]['size']
-            stackElements += [(stackElement, size, off)]
-    return sorted(stackElements,key=lambda se : se[2])
-
-def generateLabel(functionName, functions):
-    return list(map(lambda x : x[1], generateDebugLabel(functionName, functions)))
-
-def generateFeature(functionName, functions):
-    ops = map(lambda x : x[1].replace(' ', ''), functions[functionName]['disas'])
-    return 'START '+' '.join(ops)+' END'
+'''
+for func in functions:
+    print('////////////////////////')
+    print(func.name, func.frame_base)
+    for lvar in func.variables:
+        print(lvar.name, lvar.type, "(bytesize = %d)"%lvar.type.byte_size)
+        for loc in lvar.locations:
+            print(hex(loc.begin) + " to " + hex(loc.end) + ": " \
+#            + str(loc.type)[13:]
+            + str(loc.expr))
+        print('')
+'''
