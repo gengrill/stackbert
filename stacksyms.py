@@ -14,6 +14,16 @@ from dwarf_import.io.dwarf_expr import ExprEval, LocExprParser
 from dwarf_import.io.dwarf_import import DWARFDB, DWARFImporter
 from dwarf_import.io.dwarf_import import place_component_in_module_tree
 
+def parseFunctions(debugFilepath):
+    module, importer = parseDWARF(debugFilepath)
+    firstUnit = module.components[0]
+    functions = firstUnit.functions
+    disasQueries = ['disas /r ' + func.name for func in functions]
+    gdbOut = staticGDB(debugFilepath, functions, disasQueries)
+    for disas, func in zip(gdbOut, functions):
+        func.disas = [tuple(line.strip().split('\\t')) for line in disas[1:-1]]
+    return functions
+
 def parseDWARF(debugFilepath):
 #    return create_module_from_ELF_DWARF_file(debugFilepath)
 # we need the line program to get basic blocks (or at least the first one)
@@ -35,10 +45,13 @@ def generateDebugLabel(func):
 #                      + str(loc.type)[13:] + str(loc.expr))
 '''
 
-def generateFeatures(function):
-    return list(map(lambda t : t[1].replace(' ', ''), function.disas))
+def tokenize(features): # a token is two bytes
+    return [[int(x[i:i+2], 16) for i in range(0,len(x),2)] for x in features]
 
-def generatePositionalEncodings(function):
+def generateFeatures(function): # a feature is an instruction (128 bytes max)
+    return tokenize(map(lambda t : t[1].replace(' ', ''), function.disas))
+
+def generatePositionalEncodings(function): # code addresses
     return list(map(lambda t : t[0][0:18], function.disas))
 
 
@@ -49,7 +62,7 @@ def isOnStack(variable): # TODO should be named "isOnStackInInitialFrame"
     #     of the first basic block of the function.. otherwise its
     #     creation is dependent on the function's control flow.
     # (3) if so, whether the location isn't actually a register.
-    # (4) if so, return the offset from frame base
+    # (4) if so, return the offset from frame base along with its size
     if len(variable.locations)==0:
         return False
     if variable.type == LocationType.STATIC_GLOBAL:
