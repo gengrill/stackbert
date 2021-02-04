@@ -32,14 +32,22 @@ def parseELF(filepath):
     logging.info(f"Trying to parse {filepath} as ELF")
     elf = ELFFile(open(filepath, 'rb'))
     module, importer = parseDWARF(elf)
-    functions = getFunctions(module)  # a list of model.elements.Function type objects
+    functions = getFunctions(module) # a list of model.elements.Function type objects
+    collectCFI(functions, elf)
     logging.info(f"Found {len(functions)} functions.")
-    return functions
+    return elf
 
-# 1: walk directory -> foreach file
-# 2:   parse ELF & DWARF
-#        get list of functions along with their parsed data model
-# 3:   collect disas & initial frame layout
+def parseDWARF(elf):
+    if elf.has_dwarf_info():
+        logging.info("File has debug info..")
+        module = Module() # this is high-level the data model (no deps on ELF/DWARF types etc)
+        dwarfDB = DWARFDB(elf) # this the io data class for parsing
+        importer = DWARFImporter(dwarfDB, dict()) # has state after parsing
+        for component in importer.import_components():
+            place_component_in_module_tree(module, component)
+        return module, importer
+    logging.warn("File does not contain debugging information!")
+    return None
 
 def getFunctions(module):
     '''Returns a list of dwarf_import.model.elements.Function objects.'''
@@ -48,13 +56,46 @@ def getFunctions(module):
         if type(m) == Module:
             functions += getFunctions(m)
         if type(m) == Component:
-            logging.debug(f"Found {len(m.functions)} function definitions in component {m.name}")
+            logging.debug(f'Found {len(m.functions)} function definitions in component {m.name}')
             functions += m.functions
     return functions
 
+def getFrameSize(function):
+    '''Get (maximum) frame size for func from itsshould probably be named getMaxFrameSize'''
+    # The number we get here statically from the .eh_frame section can actually be validated using GDB:
+    # ./gdb path/to/prog
+    # (gdb) set confirmation off
+    # (gdb) break {func.name}
+    # (gdb) r
+    # (gdb) rbreak .
+    # (gdb) c
+    # (gdb) info frame
+    #  at this point "frame at 0xADDRESS_A" - "called by frame at 0xADDRESS_B" should match our number below
+    funcFrameRegs = [(key, val) for d in function.frame for key, val in d.items() if type(key)==int]
+    return abs(min(funcFrameRegs, key=lambda t : t[1].arg)[1].arg)
+
+def collectFrameInfo(functions, elf):
+    from elftools.dwarf.callframe import ZERO
+    dwarfInfo = elf.get_dwarf_info()
+    if dwarfInfo.has_EH_CFI():
+        logging.info('has .eh_frames')
+        cfi_entries = dwarfInfo.EH_CFI_entries()
+        for entry in cfi_entries:
+            if not type(entry) == ZERO:
+                frame_table = entry.get_decoded().table
+                if len(frame_table) == 0:
+                    logging.warn(f'Empty frame table for entry {entry}!')
+                    continue
+                for func in functions: # TODO these two loops take forever.. rewrite as lookup
+                    if any(filter(lambda d : func.start == d['pc'], frame_table)):
+                        logging.info(f'Found frame info for function {func.name}.')
+                        func.frame = frame_table
+                        func.arch  = elf.get_machine_arch() # need this, e.g., for register descriptions
+    logging.warn('Does not contain .eh_frames section')
+
 def collectDisassembly(functions):
     #TODO
-    logging.info("Trying to collect function bodies via GDB..")
+    logging.info('Trying to collect function bodies via GDB..')
     disasQueries = ['disas /r ' + func.name for func in functions]
     gdbOut = staticGDB(debugFilepath, functions, disasQueries)
     for disas, func in zip(gdbOut, functions):
@@ -67,21 +108,6 @@ def generateDebugLabel(func):
 #    return [
 #                print(hex(loc.begin) + " to " + hex(loc.end) + ": " \
 #                      + str(loc.type)[13:] + str(loc.expr))
-
-
-def parseDWARF(elf):
-#    return create_module_from_ELF_DWARF_file(debugFilepath)
-# we need the line program to get basic blocks (or at least the first one)
-    if elf.has_dwarf_info():
-        logging.info("File has debug info..")
-        module = Module() # this is high-level the data model (no deps on ELF/DWARF types etc)
-        dwarfDB = DWARFDB(elf) # this the io data class for parsing
-        importer = DWARFImporter(dwarfDB, dict()) # has state after parsing
-        for component in importer.import_components():
-            place_component_in_module_tree(module, component)
-        return module, importer
-    logging.warn("File does not contain debugging information!")
-    return None
 
 def isOnStack(variable):
     # TODO This should probably be named "isOnStackInInitialFrame" or sth like that.
