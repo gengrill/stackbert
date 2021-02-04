@@ -33,9 +33,9 @@ def parseELF(filepath):
     elf = ELFFile(open(filepath, 'rb'))
     module, importer = parseDWARF(elf)
     functions = getFunctions(module) # a list of model.elements.Function type objects
-    collectCFI(functions, elf)
     logging.info(f"Found {len(functions)} functions.")
-    return elf
+    collectFrameInfo(functions, elf)
+    return functions
 
 def parseDWARF(elf):
     if elf.has_dwarf_info():
