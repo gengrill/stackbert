@@ -9,7 +9,7 @@ from elftools.elf.elffile import ELFFile
 
 # from https://github.com/Vector35/dwarf_import
 from dwarf_import.model.module import Module
-from dwarf_import.model.elements import Component, LocationType
+from dwarf_import.model.elements import Component, Parameter, LocalVariable, Location, Type, LocationType
 from dwarf_import.io.dwarf_expr import ExprEval, LocExprParser
 #from dwarf_import.io.dwarf_import import create_module_from_ELF_DWARF_file
 from dwarf_import.io.dwarf_import import DWARFDB, DWARFImporter
@@ -27,14 +27,21 @@ def parseDirectory(dirPath):
     logging.info(f"Found {sum(map(len,functions))} functions total in {len(functions)} files.")
     return fmap
 
-def parseELF(filepath):
+def parseELF(filepath, validateWithGDB=False, gdbmi=None):
     '''Returns a list of functions for this file (if the file contains debug info)'''
     logging.info(f"Trying to parse {filepath} as ELF")
     elf = ELFFile(open(filepath, 'rb'))
     module, importer = parseDWARF(elf)
     functions = getFunctions(module) # a list of model.elements.Function type objects
     logging.info(f"Found {len(functions)} functions.")
-    collectFrameInfo(functions, elf)
+    functions = collectFrameInfo(functions, elf)
+    if validateWithGDB:
+        # collect the same info we parsed from .eh_frames section for validation
+        _gdbmi  = gdbmi if gdbmi is not None else GdbController() 
+        functions = collectLocals(_gdbmi, functions, filepath)
+        functions = collectDisassembly(_gdbmi, functions, filepath)
+        if gdbmi is None:
+            _gdbmi.exit()
     return functions
 
 def parseDWARF(elf):
@@ -91,16 +98,69 @@ def collectFrameInfo(functions, elf):
                         logging.info(f'Found frame info for function {func.name}.')
                         func.frame = frame_table
                         func.arch  = elf.get_machine_arch() # need this, e.g., for register descriptions
+        return functions
     logging.warn('Does not contain .eh_frames section')
+    return functions
 
-def collectDisassembly(functions):
-    #TODO
+def collectDisassembly(gdbmi, functions, debugFilepath):
     logging.info('Trying to collect function bodies via GDB..')
-    disasQueries = ['disas /r ' + func.name for func in functions]
-    gdbOut = staticGDB(debugFilepath, functions, disasQueries)
+    disasQueries = [f'disas /r {func.name}' for func in functions]
+    gdbOut = staticGDB(gdbmi, debugFilepath, functions, disasQueries)
     for disas, func in zip(gdbOut, functions):
         func.disas = [tuple(line.strip().split('\\t')) for line in disas[1:-1]]
     return functions
+
+def collectLocals(gdbmi, functions, debugFilepath):
+    logging.info("Trying to collect stack locals via GDB..")
+    scopeQueries = [f"info scope {func.name}" for func in functions]
+    gdbOut = staticGDB(gdbmi, debugFilepath, functions, scopeQueries)
+    for scope, func in zip(gdbOut, functions):
+        symbol, size, off = None, None, None
+        for line in scope: # depends on line order of GDB output
+            if line.find('Symbol') != -1: # Symbol name comes first
+                symbolName = line.split(' ')[1]
+                logging.debug(f"Found stack element {symbolName}.")
+                size, off = None, None
+                symbol = next((p for p in func.parameters if symbolName==p.name), None)
+                if symbol is None:
+                    logging.debug("Not a parameter, maybe local?")
+                    symbol = next((l for l in func.variables if symbolName==l.name), None)
+                    if symbol is None:
+                        logging.warning(f"Stack symbol {symbolName} reported by GDB but not by PyELFTools.")
+                        continue
+                logging.debug(f"Found scope info for stack element {symbol}")
+            elif symbol is not None and line.find("length") != -1: # Size usually comes last
+                size = int(line[line.find('length') + 6 : -3])
+                logging.debug(f"GDB reports size info ({size} bytes)!")
+                logging.info("Locations: " + str(list(map(lambda loc : f"begin={hex(loc.begin)}, end={hex(loc.end)}", symbol.locations))))
+                if symbol.type.byte_size is None:
+                    logging.warning(f"Setting previously unknown size to {size} bytes!")
+                    symbol.type._byte_size = size
+                elif symbol.type.byte_size != size:
+                    logging.warning(f"GDB size ({size}) and PyELFTtools size ({symbol.type.byte_size}) differ!")
+                else:
+                    logging.debug("GDB size and PyELFTools size are equal.")
+            elif symbol is not None and line.find("DW_OP_fbreg") != -1: # Location second (maybe multiple, but focus on frame offsets)
+                if not any(symbol.locations):
+                    off = line.split(' ')[6::]
+                    begin = int(off[1][0:-2])
+                    loc = Location(begin, 0, LocationType.STATIC_LOCAL, off)
+                    logging.info(f"Adding location {loc}.")
+                    symbol.add_location(loc)
+                logging.debug("Has stack location!")
+    return functions
+
+# using GDB for two reasons: (1) it gives us both disassembly and local variables, and (2) everyone has it
+def staticGDB(gdbmi, filepath, functions, queries):
+    """Obtains additional info about stack variables from GDB (w/o running the binary)."""
+    logging.info(f"Loading {filepath} statically in GDB.")
+    result = [gdbmi.write(f"-file-exec-and-symbols {filepath}")]
+    for q in queries:
+        result += [[msg["payload"] for msg in gdbmi.write(q) if msg["type"]=="console"]]
+    return result[1:] # skip meta output
+
+
+# remaining stuff is WIP and not currently usable
 
 def generateDebugLabel(func):
 #    TODO
@@ -146,47 +206,3 @@ def isInReg(variable): # TODO should be named "isInRegInInitialFrame"
 
 def generateLabels(function):
     return list(map(lambda x : x[1], generateDebugLabel(function)))
-
-def collectLocals(gdbOutput, functions):
-    symbol, size, off = None, None, None
-    for line in gdbOutput[1:]:
-        if line.find('Symbol') != -1:
-            symbol = line.split(' ')[1]
-            size, off = None, None
-            logging.info("Found scope info for symbol %s" % symbol)
-        elif line.find('length') != -1:
-            size = int(line[line.find('length') + 6 : -3])
-            funcDict[symbol]['size']   = size
-            logging.info("Has size info (%d bytes)!" % size)
-        elif line.find('DW_OP_fbreg') != -1:
-            if 'offset' not in funcDict[symbol]:
-                funcDict[symbol]['offset'] = []
-            off = line.split(' ')[6::]
-            funcDict[symbol]['offset'] += [(off[0], int(off[1][0:-2]))]
-            logging.info("Has stack location!")
-        if symbol != None and symbol not in funcDict:
-            logging.warning("Symbol '%s' reported in function scope by GDB but not by PyELFTools." % symbol)
-            return
-
-# using GDB for two reasons: (1) it gives us both disassembly and local variables, and (2) everyone has it
-def staticGDB(gdbmi, filepaths, functions, queries):
-    """Obtains additional info about stack variables from GDB (w/o running the binary)."""
-    if type(filepaths) == str: # just one path
-        logging.info("Loading file %s statically in GDB." % filepaths)
-        
-        result = [gdbmi.write('-file-exec-and-symbols ' + filepaths)]
-        for q in queries:
-            result += [[msg['payload'] for msg in gdbmi.write(q) if msg['type']=='console']]
-        gdbmi.exit()
-        return result[1:] # skip meta output
-    elif type(filepaths) == list:
-        logging.info("Batch loading several files statically in GDB..")
-        gdbmi  = GdbController()
-        result = []
-        for fpath in filepaths:
-            fileResult = [gdbmi.write('-file-exec-and-symbols ' + fpath)]
-            for q in queries:
-                fileResult += [[msg['payload'] for msg in gdbmi.write(q) if msg['type']=='console']]
-            result += fileResult[1:]
-        gdbmi.exit()
-        return result
