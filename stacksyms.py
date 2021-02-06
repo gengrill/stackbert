@@ -68,16 +68,22 @@ def getFunctions(module):
     return functions
 
 def getFrameSize(function):
-    '''Get (maximum) frame size for func from itsshould probably be named getMaxFrameSize'''
-    # The number we get here statically from the .eh_frame section can actually be validated using GDB:
-    # ./gdb path/to/prog
-    # (gdb) set confirmation off
-    # (gdb) break {func.name}
-    # (gdb) r
-    # (gdb) rbreak .
-    # (gdb) c
-    # (gdb) info frame
-    #  at this point "frame at 0xADDRESS_A" - "called by frame at 0xADDRESS_B" should match our number below
+    '''Get (maximum) frame size for func from its frame table (should probably be named getMaxFrameSize).
+       The number we get here statically from the .eh_frame section can actually be validated using GDB:
+       ./gdb path/to/prog
+       (gdb) set confirmation off
+       (gdb) break {func.name}
+       (gdb) r
+       (gdb) rbreak .
+       (gdb) c
+       (gdb) info frame
+        at this point "frame at 0xADDRESS_A" - "called by frame at 0xADDRESS_B" should match our number below'''
+    # The frame table is a list of dicts, where integer keys are register numbers for the architecture.
+    # So we get the register entries and look for the biggest offset.
+    # TODO: this undercounts e.g. in the case of 'quotearg_char_mem' in the 'sum' binary (reports 32 bytes instead of 88).
+    #       could potentially be fixed, because we have the size of locals (32 bytes reported + 56 for locals = 88 total).
+    # TODO: nope, doesn't seem like it.. for 'quotearg_n_style_mem' it should be 104 bytes but locals account for only 56 + 40 reported
+    #       (well plus 8 for return address that would be a match??)
     funcFrameRegs = [(key, val) for d in function.frame for key, val in d.items() if type(key)==int]
     return abs(min(funcFrameRegs, key=lambda t : t[1].arg)[1].arg)
 
@@ -89,7 +95,7 @@ def collectFrameInfo(functions, elf):
         cfi_entries = dwarfInfo.EH_CFI_entries()
         for entry in cfi_entries:
             if not type(entry) == ZERO:
-                frame_table = entry.get_decoded().table
+                frame_table = entry.get_decoded().table # elftools.dwarf.callframe.DecodedCallFrameTable
                 if len(frame_table) == 0:
                     logging.warn(f'Empty frame table for entry {entry}!')
                     continue
