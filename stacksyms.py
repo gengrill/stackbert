@@ -9,7 +9,7 @@ from elftools.elf.elffile import ELFFile
 
 # from https://github.com/Vector35/dwarf_import
 from dwarf_import.model.module import Module
-from dwarf_import.model.elements import Component, Parameter, LocalVariable, Location, Type, LocationType
+from dwarf_import.model.elements import Component, Parameter, LocalVariable, Location, Type, LocationType, ExprOp
 from dwarf_import.io.dwarf_expr import ExprEval, LocExprParser
 #from dwarf_import.io.dwarf_import import create_module_from_ELF_DWARF_file
 from dwarf_import.io.dwarf_import import DWARFDB, DWARFImporter
@@ -49,6 +49,8 @@ def processExpressions(functions, importer):
     # TODO this is a hack, should be part of the dwar_import processing.. maybe create a patch later
     from collections import defaultdict
     from elftools.dwarf.descriptions import describe_reg_name
+    # The frame table is a list of dicts, where integer keys are register numbers for the architecture.
+    # So we get the register entries and create Location objects on the fly..
     for func in functions:
         func.registers = defaultdict(set)
         for d in func.frame:
@@ -97,32 +99,25 @@ def getMaxFrameSize(function):
        (gdb) c
        (gdb) info frame
         at this point "frame at 0xADDRESS_A" - "called by frame at 0xADDRESS_B" should match our number below'''
-    # The frame table is a list of dicts, where integer keys are register numbers for the architecture.
-    # So we get the register entries and look for the biggest offset.
-    # TODO: this undercounts e.g. in the case of 'quotearg_char_mem' in the 'sum' binary (reports 32 bytes instead of 88).
-    #       could potentially be fixed, because we have the size of locals (32 bytes reported + 56 for locals = 88 total).
-    # TODO: nope, doesn't seem like it.. for 'quotearg_n_style_mem' it should be 104 bytes but locals account for only 56 + 40 reported
-    #       (well plus 8 for return address that would be a match??)
     return abs(min(getMinParamOff(function), getMinLocalOff(function), getMinRegOff(function)))
 
+def locExprHasOffset(location): # TODO y0 d4wg, this sh!t is sketchy as f*&^
+    if len(location.expr) > 1 and type(location.expr[1]) == int:
+        return True
+    return False
+
 def getMinParamOff(function):
-    if len(function.parameters) == 0:
-        return 0
-    print([par.locations for par in function.parameters])
-    return min(loc.expr[1] for par in function.parameters for loc in par.locations)
+    return min([0]+[loc.expr[1] for par in function.parameters for loc in filter(locExprHasOffset, par.locations)])
 
 def getMinLocalOff(function):
-    if len(function.variables) == 0:
-        return 0
-    print([var.locations for var in function.variables])
-    return min(loc.expr[1] for var in function.variables for loc in var.locations)
+    return min([0]+[loc.expr[1] for var in function.variables for loc in filter(locExprHasOffset, var.locations)])
 
 def getMinRegOff(function):
     minOff = 0 # largest absolute offset value from frame base pointer
     if len(function.registers) == 0:
         return 0
     for reg, locs in function.registers.items():
-        regMinOff = min(loc.expr[1] for loc in locs)
+        regMinOff = min([0]+[loc.expr[1] for loc in filter(locExprHasOffset, locs)])
         minOff = regMinOff if abs(minOff) < abs(regMinOff) else minOff
         if 0 < minOff:
             logging.warn(f"Minimum frame offset for function {function.name} is +{minOff}!")
