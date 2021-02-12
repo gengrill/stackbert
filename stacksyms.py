@@ -35,6 +35,7 @@ def parseELF(filepath, validateWithGDB=False, gdbmi=None):
     functions = getFunctions(module) # a list of model.elements.Function type objects
     logging.info(f"Found {len(functions)} functions.")
     functions = collectFrameInfo(functions, elf)
+    functions = processExpressions(functions, importer) # process dynamic register locs
     if validateWithGDB:
         # collect the same info we parsed from .eh_frames section for validation
         _gdbmi  = gdbmi if gdbmi is not None else GdbController() 
@@ -42,6 +43,24 @@ def parseELF(filepath, validateWithGDB=False, gdbmi=None):
         functions = collectDisassembly(_gdbmi, functions, filepath)
         if gdbmi is None:
             _gdbmi.exit()
+    return functions
+
+def processExpressions(functions, importer):
+    # TODO this is a hack, should be part of the dwar_import processing.. maybe create a patch later
+    from collections import defaultdict
+    from elftools.dwarf.descriptions import describe_reg_name
+    for func in functions:
+        func.registers = defaultdict(set)
+        for d in func.frame:
+            for regNo, regRule in d.items():
+                if type(regNo)==int:
+                    loc = None
+                    if regRule.type == 'OFFSET': # the tuple here just unifies both cases to [1]
+                        loc = Location(func.start, 0x0, LocationType.STATIC_LOCAL, (0, regRule.arg))
+                    elif regRule.type == 'EXPRESSION':
+                        loc = importer._location_factory.make_location(func.start, 0x0, regRule.arg)
+#                        print(describe_reg_name(regNo, func.arch) + " => " + repr(loc))
+                    func.registers[regNo] |= {loc}
     return functions
 
 def parseDWARF(elf):
@@ -67,9 +86,9 @@ def getFunctions(module):
             functions += m.functions
     return functions
 
-def getFrameSize(function):
-    '''Get (maximum) frame size for func from its frame table (should probably be named getMaxFrameSize).
-       The number we get here statically from the .eh_frame section can actually be validated using GDB:
+def getMaxFrameSize(function):
+    '''Get maximum frame size based on its parameter, local, and stored register offsets.
+       The number we compute here statically from the .eh_frame section can actually be validated using GDB:
        ./gdb path/to/prog
        (gdb) set confirmation off
        (gdb) break {func.name}
@@ -84,8 +103,30 @@ def getFrameSize(function):
     #       could potentially be fixed, because we have the size of locals (32 bytes reported + 56 for locals = 88 total).
     # TODO: nope, doesn't seem like it.. for 'quotearg_n_style_mem' it should be 104 bytes but locals account for only 56 + 40 reported
     #       (well plus 8 for return address that would be a match??)
-    funcFrameRegs = [(key, val) for d in function.frame for key, val in d.items() if type(key)==int]
-    return abs(min(funcFrameRegs, key=lambda t : t[1].arg)[1].arg)
+    return abs(min(getMinParamOff(function), getMinLocalOff(function), getMinRegOff(function)))
+
+def getMinParamOff(function):
+    if len(function.parameters) == 0:
+        return 0
+    print([par.locations for par in function.parameters])
+    return min(loc.expr[1] for par in function.parameters for loc in par.locations)
+
+def getMinLocalOff(function):
+    if len(function.variables) == 0:
+        return 0
+    print([var.locations for var in function.variables])
+    return min(loc.expr[1] for var in function.variables for loc in var.locations)
+
+def getMinRegOff(function):
+    minOff = 0 # largest absolute offset value from frame base pointer
+    if len(function.registers) == 0:
+        return 0
+    for reg, locs in function.registers.items():
+        regMinOff = min(loc.expr[1] for loc in locs)
+        minOff = regMinOff if abs(minOff) < abs(regMinOff) else minOff
+        if 0 < minOff:
+            logging.warn(f"Minimum frame offset for function {function.name} is +{minOff}!")
+    return minOff
 
 def collectFrameInfo(functions, elf):
     from elftools.dwarf.callframe import ZERO
