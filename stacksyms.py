@@ -47,12 +47,13 @@ def parseELF(filepath, validateWithGDB=False, gdbmi=None):
 
 def processExpressions(functions, importer):
     # TODO this is a hack, should be part of the dwar_import processing.. maybe create a patch later
-    from collections import defaultdict
+    from collections import namedtuple
     from elftools.dwarf.descriptions import describe_reg_name
+    Register = namedtuple('Register',['number','name','locations'])
     # The frame table is a list of dicts, where integer keys are register numbers for the architecture.
     # So we get the register entries and create Location objects on the fly..
     for func in functions:
-        func.registers = defaultdict(set)
+        func.registers = dict() # TODO maybe flatten to be just a list of Register objects?
         for d in func.frame:
             for regNo, regRule in d.items():
                 if type(regNo)==int:
@@ -61,8 +62,9 @@ def processExpressions(functions, importer):
                         loc = Location(func.start, 0x0, LocationType.STATIC_LOCAL, (0, regRule.arg))
                     elif regRule.type == 'EXPRESSION':
                         loc = importer._location_factory.make_location(func.start, 0x0, regRule.arg)
-#                        print(describe_reg_name(regNo, func.arch) + " => " + repr(loc))
-                    func.registers[regNo] |= {loc}
+                    if regNo not in func.registers:
+                        func.registers[regNo] = Register(regNo, describe_reg_name(regNo, func.arch), set())
+                    func.registers[regNo].locations.update({loc})
     return functions
 
 def parseDWARF(elf):
@@ -98,30 +100,16 @@ def getMaxFrameSize(function):
        (gdb) rbreak .
        (gdb) c
        (gdb) info frame
-        at this point "frame at 0xADDRESS_A" - "called by frame at 0xADDRESS_B" should match our number below'''
-    return abs(min(getMinParamOff(function), getMinLocalOff(function), getMinRegOff(function)))
+       At this point "frame at 0xADDRESS_A" - "called by frame at 0xADDRESS_B" should match our number below'''
+    return abs(min(getMinOff(function.parameters), getMinOff(function.variables), getMinOff(function.registers.values())))
 
 def locExprHasOffset(location): # TODO y0 d4wg, this sh!t is sketchy as f*&^
     if len(location.expr) > 1 and type(location.expr[1]) == int:
         return True
     return False
 
-def getMinParamOff(function):
-    return min([0]+[loc.expr[1] for par in function.parameters for loc in filter(locExprHasOffset, par.locations)])
-
-def getMinLocalOff(function):
-    return min([0]+[loc.expr[1] for var in function.variables for loc in filter(locExprHasOffset, var.locations)])
-
-def getMinRegOff(function):
-    minOff = 0 # largest absolute offset value from frame base pointer
-    if len(function.registers) == 0:
-        return 0
-    for reg, locs in function.registers.items():
-        regMinOff = min([0]+[loc.expr[1] for loc in filter(locExprHasOffset, locs)])
-        minOff = regMinOff if abs(minOff) < abs(regMinOff) else minOff
-        if 0 < minOff:
-            logging.warn(f"Minimum frame offset for function {function.name} is +{minOff}!")
-    return minOff
+def getMinOff(stkElms):
+    return min([0]+[loc.expr[1] for stkElm in stkElms for loc in filter(locExprHasOffset, stkElm.locations)])
 
 def collectFrameInfo(functions, elf):
     from elftools.dwarf.callframe import ZERO
