@@ -35,7 +35,8 @@ def parseELF(filepath, validateWithGDB=False, gdbmi=None):
     functions = getFunctions(module) # a list of model.elements.Function type objects
     logging.info(f"Found {len(functions)} functions.")
     functions = collectFrameInfo(functions, elf)
-    functions = processExpressions(functions, importer) # process dynamic register locs
+    functions = processRegisterRuleExpressions(functions, importer) # process dynamic register locs
+    functions = propagateTypeInfo(functions, importer) # element.type.byte_size is None most of the time -> try and fix it
     if validateWithGDB:
         # collect the same info we parsed from .eh_frames section for validation
         _gdbmi  = gdbmi if gdbmi is not None else GdbController() 
@@ -43,28 +44,6 @@ def parseELF(filepath, validateWithGDB=False, gdbmi=None):
         functions = collectDisassembly(_gdbmi, functions, filepath)
         if gdbmi is None:
             _gdbmi.exit()
-    return functions
-
-def processExpressions(functions, importer):
-    # TODO this is a hack, should be part of the dwar_import processing.. maybe create a patch later
-    from collections import namedtuple
-    from elftools.dwarf.descriptions import describe_reg_name
-    Register = namedtuple('Register',['number','name','locations'])
-    # The frame table is a list of dicts, where integer keys are register numbers for the architecture.
-    # So we get the register entries and create Location objects on the fly..
-    for func in functions:
-        func.registers = dict() # TODO maybe flatten to be just a list of Register objects?
-        for d in func.frame:
-            for regNo, regRule in d.items():
-                if type(regNo)==int:
-                    loc = None
-                    if regRule.type == 'OFFSET': # the tuple here just unifies both cases to [1]
-                        loc = Location(func.start, 0x0, LocationType.STATIC_LOCAL, (0, regRule.arg))
-                    elif regRule.type == 'EXPRESSION':
-                        loc = importer._location_factory.make_location(func.start, 0x0, regRule.arg)
-                    if regNo not in func.registers:
-                        func.registers[regNo] = Register(regNo, describe_reg_name(regNo, func.arch), set())
-                    func.registers[regNo].locations.update({loc})
     return functions
 
 def parseDWARF(elf):
@@ -90,27 +69,6 @@ def getFunctions(module):
             functions += m.functions
     return functions
 
-def getMaxFrameSize(function):
-    '''Get maximum frame size based on its parameter, local, and stored register offsets.
-       The number we compute here statically from the .eh_frame section can actually be validated using GDB:
-       ./gdb path/to/prog
-       (gdb) set confirmation off
-       (gdb) break {func.name}
-       (gdb) r
-       (gdb) rbreak .
-       (gdb) c
-       (gdb) info frame
-       At this point "frame at 0xADDRESS_A" - "called by frame at 0xADDRESS_B" should match our number below'''
-    return abs(min(getMinOff(function.parameters), getMinOff(function.variables), getMinOff(function.registers.values())))
-
-def locExprHasOffset(location): # TODO y0 d4wg, this sh!t is sketchy as f*&^
-    if len(location.expr) > 1 and type(location.expr[1]) == int:
-        return True
-    return False
-
-def getMinOff(stkElms):
-    return min([0]+[loc.expr[1] for stkElm in stkElms for loc in filter(locExprHasOffset, stkElm.locations)])
-
 def collectFrameInfo(functions, elf):
     from elftools.dwarf.callframe import ZERO
     dwarfInfo = elf.get_dwarf_info()
@@ -131,6 +89,80 @@ def collectFrameInfo(functions, elf):
         return functions
     logging.warn('Does not contain .eh_frames section')
     return functions
+
+def processRegisterRuleExpressions(functions, importer):
+    # TODO this is a hack, should be part of the dwar_import processing.. maybe create a patch later
+    from collections import namedtuple
+    from elftools.dwarf.descriptions import describe_reg_name
+    Register = namedtuple('Register',['number','name','locations'])
+    # The frame table is a list of dicts, where integer keys are register numbers for the architecture.
+    # So we get the register entries and create Location objects on the fly..
+    for func in functions:
+        func.registers = dict() # TODO maybe flatten to be just a list of Register objects?
+        for d in func.frame:
+            for regNo, regRule in d.items():
+                if type(regNo)==int:
+                    loc = None
+                    if regRule.type == 'OFFSET': # the tuple here just unifies both cases to [1]
+                        loc = Location(func.start, 0x0, LocationType.STATIC_LOCAL, (0, regRule.arg))
+                    elif regRule.type == 'EXPRESSION':
+                        loc = importer._location_factory.make_location(func.start, 0x0, regRule.arg)
+                    if regNo not in func.registers:
+                        func.registers[regNo] = Register(regNo, describe_reg_name(regNo, func.arch), set())
+                    func.registers[regNo].locations.update({loc})
+    return functions
+
+def propagateTypeInfo(functions, importer):
+    # TODO implement
+    types = set()
+    for function in functions:
+            types |= {parameter.type for parameter in function.parameters}
+            types |= {variable.type for variable in function.variables}
+    #logging.info(f"{types}")
+    for _type in types:
+        if not _type.is_qualified_type and _type.byte_size is None:
+            if _type.array_count is not None:
+                arrayType = resolveType(_type)
+                if not arrayType.is_base:
+                    logging.warn(f"Can't resolve array type {_type}!")
+                    continue
+                _type._byte_size = _type.array_count * arrayType.byte_size # TODO check correctness
+            elif _type.composite_type is not None:
+                logging.warn(f"Can't yet handle composite type {_type}!")
+            elif _type.element is not None: # this is the frequent case
+                base = resolveType(_type)
+                if base.byte_size is None:
+                    logging.warn(f"Type propagation for type {base} yields size 'None'!")
+                    continue
+                _type._byte_size = base._byte_size # TODO check correctness
+    #for Type in importer._type_factory.iter_types():
+    #    print(Type)
+    return functions
+
+def resolveType(_type):
+    return _type if _type.element is None else resolveType(_type.element)
+
+def getMaxFrameSize(function):
+    '''Get maximum frame size based on its parameter, local, and stored register offsets.
+       The number we compute here statically from the .eh_frame section can actually be validated using GDB:
+       ./gdb path/to/prog
+       (gdb) set confirmation off
+       (gdb) break {func.name}
+       (gdb) r
+       (gdb) rbreak .
+       (gdb) c
+       (gdb) info frame
+       At this point "frame at 0xADDRESS_A" - "called by frame at 0xADDRESS_B" should match our number below'''
+#    return abs(min(getMinOff(function.parameters), getMinOff(function.variables), getMinOff(function.registers.values())))
+    return abs(min(map(getMinOff, [function.parameters, function.variables, function.registers.values()])))
+
+def getMinOff(stkElms):
+    return min([0]+[loc.expr[1] for stkElm in stkElms for loc in filter(locExprHasOffset, stkElm.locations)])
+
+def locExprHasOffset(location): # TODO y0 d4wg, this sh!t is sketchy as f*&^
+    if len(location.expr) > 1 and type(location.expr[1]) == int:
+        return True
+    return False
 
 def collectDisassembly(gdbmi, functions, debugFilepath):
     logging.info('Trying to collect function bodies via GDB..')
