@@ -9,7 +9,7 @@ from elftools.elf.elffile import ELFFile
 
 # from https://github.com/Vector35/dwarf_import
 from dwarf_import.model.module import Module
-from dwarf_import.model.elements import Component, Parameter, LocalVariable, Location, Type, LocationType, ExprOp
+from dwarf_import.model.elements import Function, Component, Parameter, LocalVariable, Location, Type, LocationType, ExprOp
 from dwarf_import.io.dwarf_expr import ExprEval, LocExprParser
 #from dwarf_import.io.dwarf_import import create_module_from_ELF_DWARF_file
 from dwarf_import.io.dwarf_import import DWARFDB, DWARFImporter
@@ -90,15 +90,31 @@ def collectFrameInfo(functions, elf):
     logging.warn('Does not contain .eh_frames section')
     return functions
 
+def getRegisterSize(arch):
+    if arch == 'x86':
+        return 4
+    elif arch == 'x64':
+        return 8
+    elif arch == 'ARM':
+        return 4
+    elif arch == 'AArch64':
+        return 8
+    elif arch == 'MIPS':
+        return 8
+    raise ValueError(f'unrecognized architecture: {arch}')
+
 def processRegisterRuleExpressions(functions, importer):
     # TODO this is a hack, should be part of the dwar_import processing.. maybe create a patch later
     from collections import namedtuple
     from elftools.dwarf.descriptions import describe_reg_name
     Register = namedtuple('Register',['number','name','locations'])
+    Register.type = Type(name='Register')
+    Function.registers = property(lambda self : list(self._registers.values()))
     # The frame table is a list of dicts, where integer keys are register numbers for the architecture.
     # So we get the register entries and create Location objects on the fly..
     for func in functions:
-        func.registers = dict() # TODO maybe flatten to be just a list of Register objects?
+        Register.type._byte_size = getRegisterSize(func.arch)
+        func._registers = dict() # TODO maybe flatten to be just a list of Register objects?
         for d in func.frame:
             for regNo, regRule in d.items():
                 if type(regNo)==int:
@@ -107,9 +123,9 @@ def processRegisterRuleExpressions(functions, importer):
                         loc = Location(func.start, 0x0, LocationType.STATIC_LOCAL, (0, regRule.arg))
                     elif regRule.type == 'EXPRESSION':
                         loc = importer._location_factory.make_location(func.start, 0x0, regRule.arg)
-                    if regNo not in func.registers:
-                        func.registers[regNo] = Register(regNo, describe_reg_name(regNo, func.arch), set())
-                    func.registers[regNo].locations.update({loc})
+                    if regNo not in func._registers:
+                        func._registers[regNo] = Register(regNo, describe_reg_name(regNo, func.arch), set())
+                    func._registers[regNo].locations.update({loc})
     return functions
 
 def propagateTypeInfo(functions, importer):
@@ -153,8 +169,8 @@ def getMaxFrameSize(function):
        (gdb) c
        (gdb) info frame
        At this point "frame at 0xADDRESS_A" - "called by frame at 0xADDRESS_B" should match our number below'''
-#    return abs(min(getMinOff(function.parameters), getMinOff(function.variables), getMinOff(function.registers.values())))
-    return abs(min(map(getMinOff, [function.parameters, function.variables, function.registers.values()])))
+#    return abs(min(getMinOff(function.parameters), getMinOff(function.variables), getMinOff(function.registers)))
+    return abs(min(map(getMinOff, [function.parameters, function.variables, function.registers])))
 
 def getMinOff(stkElms):
     return min([0]+[loc.expr[1] for stkElm in stkElms for loc in filter(locExprHasOffset, stkElm.locations)])
@@ -164,6 +180,57 @@ def locExprHasOffset(location): # TODO y0 d4wg, this sh!t is sketchy as f*&^
         return True
     return False
 
+def getStackElements(function):
+    '''return stack elements (in no particular order)'''
+    candidates = function.parameters + function.variables + function.registers
+    logging.debug(f"Function {function.name} has {len(candidates)} potential stack elements.")
+    return [stkElm for stkElm in candidates if any(filter(locExprHasOffset, stkElm.locations))]
+
+def getMinOffLoc(stkElm):
+    locs = [loc.expr[1] for loc in stkElm.locations]
+    logging.debug(f"Stack element {stkElm} has {len(locs)} locations!")
+    return min(locs)
+
+def getStackLocations(stkElm):
+    return [loc.expr for loc in filter(locExprHasOffset, stkElm.locations)]
+
+def generateDebugLabel(func):
+    funElms  = len(func.parameters) + len(func.variables) + len(func.registers)
+    stkSlots = sorted(getStackElements(func), key=getMinOffLoc)
+    if len(stkSlots) != funElms:
+        logging.info(f"Function {func.name} has {len(stkSlots)} stack elements out of {funElms} total.")
+    logging.debug(f"{func.name} => [{', '.join(stkElm.name+'@ebp%+d'%getMinOffLoc(stkElm) for stkElm in stkSlots)}]")
+    return [stkElm.type.byte_size for stkElm in stkSlots]
+
+def checkLabels(functions):
+    for func in functions:
+        frame = getMaxFrameSize(func)
+        label = generateDebugLabel(func)
+        print(f"{func.name} ({frame} by offset / {sum(label)} by size) => {label}")
+
+def isOnStack(variable):
+    # TODO This should probably be named "isOnStackInInitialFrame" or sth like that.
+    # The goal here is to determine if a dwarf_import.model.elements.Variable is on stack or not
+    # when we enter the first frame of the function.. it's not trivial, we have to determine:
+    # (1) if there is a location at all (could have been optimized out)
+    # (2) if so, whether its _first_ reported location is in the range
+    #     of the first basic block of the function.. otherwise its
+    #     creation is dependent on the function's control flow.
+    # (3) if so, whether the location isn't actually a register.
+    # (4) if so, return the offset from frame base along with its size
+    if len(variable.locations)==0:
+        return False
+    if variable.type == LocationType.STATIC_GLOBAL:
+        return not isInReg(variable)
+    return False
+
+def isInReg(variable): # TODO should be named "isInRegInInitialFrame"
+    initFrameLoc = variable.locations[0]
+    if len(initFrameLoc) == 1:
+        return True # TODO: implement the check
+    return False
+
+# TODO use GDB for validation only -> collect disas somewhere else (where?)
 def collectDisassembly(gdbmi, functions, debugFilepath):
     logging.info('Trying to collect function bodies via GDB..')
     disasQueries = [f'disas /r {func.name}' for func in functions]
@@ -212,7 +279,6 @@ def collectLocals(gdbmi, functions, debugFilepath):
                 logging.debug("Has stack location!")
     return functions
 
-# using GDB for two reasons: (1) it gives us both disassembly and local variables, and (2) everyone has it
 def staticGDB(gdbmi, filepath, functions, queries):
     """Obtains additional info about stack variables from GDB (w/o running the binary)."""
     logging.info(f"Loading {filepath} statically in GDB.")
@@ -220,51 +286,3 @@ def staticGDB(gdbmi, filepath, functions, queries):
     for q in queries:
         result += [[msg["payload"] for msg in gdbmi.write(q) if msg["type"]=="console"]]
     return result[1:] # skip meta output
-
-
-# remaining stuff is WIP and not currently usable
-
-def generateDebugLabel(func):
-#    TODO
-    stackVars = filter(func.variables, isOnStack)
-#    return [
-#                print(hex(loc.begin) + " to " + hex(loc.end) + ": " \
-#                      + str(loc.type)[13:] + str(loc.expr))
-
-def isOnStack(variable):
-    # TODO This should probably be named "isOnStackInInitialFrame" or sth like that.
-    # The goal here is to determine if a dwarf_import.model.elements.Variable is on stack or not
-    # when we enter the first frame of the function.. it's not trivial, we have to determine:
-    # (1) if there is a location at all (could have been optimized out)
-    # (2) if so, whether its _first_ reported location is in the range
-    #     of the first basic block of the function.. otherwise its
-    #     creation is dependent on the function's control flow.
-    # (3) if so, whether the location isn't actually a register.
-    # (4) if so, return the offset from frame base along with its size
-    if len(variable.locations)==0:
-        return False
-    if variable.type == LocationType.STATIC_GLOBAL:
-        return not isInReg(variable)
-    return False
-
-'''
-for func in functions:
-    print('////////////////////////')
-    print(func.name, func.frame_base)
-    for lvar in func.variables:
-        print(lvar.name, lvar.type, "(bytesize = %d)"%lvar.type.byte_size)
-        for loc in lvar.locations:
-            print(hex(loc.begin) + " to " + hex(loc.end) + ": " \
-#            + str(loc.type)[13:]
-            + str(loc.expr))
-        print('')
-'''
-
-def isInReg(variable): # TODO should be named "isInRegInInitialFrame"
-    initFrameLoc = variable.locations[0]
-    if len(initFrameLoc) == 1:
-        return True # TODO: implement the check
-    return False
-
-def generateLabels(function):
-    return list(map(lambda x : x[1], generateDebugLabel(function)))
