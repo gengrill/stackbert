@@ -82,7 +82,7 @@ def collectFrameInfo(functions, elf):
                     logging.warn(f'Empty frame table for entry {entry}!')
                     continue
                 for func in functions: # TODO these two loops take forever.. rewrite as lookup
-                    if any(filter(lambda d : func.start == d['pc'], frame_table)):
+                    if any([d for d in frame_table if func.start == d['pc']]):
                         logging.info(f'Found frame info for function {func.name}.')
                         func.frame = frame_table
                         func.arch  = elf.get_machine_arch() # need this, e.g., for register descriptions
@@ -129,12 +129,19 @@ def processRegisterRuleExpressions(functions, importer):
     return functions
 
 def propagateTypeInfo(functions, importer):
-    # TODO implement
-    types = set()
+    types = set() # TODO there seem to be two 'None' type sources: VOID and VARIADIC.
     for function in functions:
-            types |= {parameter.type for parameter in function.parameters}
-            types |= {variable.type for variable in function.variables}
-    #logging.info(f"{types}")
+        for parameter in function.parameters:
+            if parameter.type is None:
+                logging.warn(f"Parameter {parameter} has 'None' Type association!")
+                continue
+            types |= {parameter.type}
+        for variable in function.variables:
+            if variable.type is None:
+                logging.warn(f"Variable {variable} has 'None' Type association!")
+                continue
+            types |= {variable.type}
+    logging.debug(f"Type list for functions: {types}")
     for _type in types:
         if not _type.is_qualified_type and _type.byte_size is None:
             if _type.array_count is not None:
@@ -169,39 +176,39 @@ def getMaxFrameSize(function):
        (gdb) c
        (gdb) info frame
        At this point "frame at 0xADDRESS_A" - "called by frame at 0xADDRESS_B" should match our number below'''
-#    return abs(min(getMinOff(function.parameters), getMinOff(function.variables), getMinOff(function.registers)))
     return abs(min(map(getMinOff, [function.parameters, function.variables, function.registers])))
 
-def getMinOff(stkElms):
-    return min([0]+[loc.expr[1] for stkElm in stkElms for loc in filter(locExprHasOffset, stkElm.locations)])
+def getMinOff(stkElms): # minimal stack offset across all elements
+    return min([0]+[loc.expr[1] for stkElm in stkElms for loc in getStackLocations(stkElm)])
+
+def generateDebugLabel(func):
+    funElms  = len(func.parameters) + len(func.variables) + len(func.registers)
+    stkSlots = sorted(getStackElements(func), key=getMinStackOff)
+    if len(stkSlots) != funElms:
+        logging.info(f"Function {func.name} has {len(stkSlots)} stack elements out of {funElms} total.")
+    logging.debug(f"{func.name} => [{', '.join(stkElm.name+'@ebp%+d'%getMinStackOff(stkElm) for stkElm in stkSlots)}]")
+    return [stkElm.type.byte_size for stkElm in stkSlots]
+
+def getStackElements(function):
+    '''return stack elements (in no particular order)'''
+    candidates = function.parameters + function.variables + function.registers
+    logging.debug(f"Function {function.name} has {len(candidates)} potential stack elements.")
+    return [stkElm for stkElm in candidates if any(getStackLocations(stkElm))]
+
+def getMinStackOff(stkElm): # minimal stack offset for a single element
+    stkLocs = getStackLocations(stkElm)
+    logging.debug(f"Stack element {stkElm} has {len(stkLocs)} stack locations (there might be more non-stack locations for this object).")
+    return min(map(lambda stkLoc : stkLoc.expr[1], stkLocs))
+
+def getStackLocations(stkElm):
+    return [loc for loc in stkElm.locations if locExprHasOffset(loc)]
 
 def locExprHasOffset(location): # TODO y0 d4wg, this sh!t is sketchy as f*&^
     if len(location.expr) > 1 and type(location.expr[1]) == int:
         return True
     return False
 
-def getStackElements(function):
-    '''return stack elements (in no particular order)'''
-    candidates = function.parameters + function.variables + function.registers
-    logging.debug(f"Function {function.name} has {len(candidates)} potential stack elements.")
-    return [stkElm for stkElm in candidates if any(filter(locExprHasOffset, stkElm.locations))]
-
-def getMinOffLoc(stkElm):
-    locs = [loc.expr[1] for loc in stkElm.locations]
-    logging.debug(f"Stack element {stkElm} has {len(locs)} locations!")
-    return min(locs)
-
-def getStackLocations(stkElm):
-    return [loc.expr for loc in filter(locExprHasOffset, stkElm.locations)]
-
-def generateDebugLabel(func):
-    funElms  = len(func.parameters) + len(func.variables) + len(func.registers)
-    stkSlots = sorted(getStackElements(func), key=getMinOffLoc)
-    if len(stkSlots) != funElms:
-        logging.info(f"Function {func.name} has {len(stkSlots)} stack elements out of {funElms} total.")
-    logging.debug(f"{func.name} => [{', '.join(stkElm.name+'@ebp%+d'%getMinOffLoc(stkElm) for stkElm in stkSlots)}]")
-    return [stkElm.type.byte_size for stkElm in stkSlots]
-
+# TODO this is just for demonstration purposes
 def checkLabels(functions):
     for func in functions:
         frame = getMaxFrameSize(func)
