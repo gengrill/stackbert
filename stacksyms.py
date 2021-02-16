@@ -128,8 +128,11 @@ def processRegisterRuleExpressions(functions, importer):
                     func._registers[regNo].locations.update({loc})
     return functions
 
+# TODO There seem to be two remaining 'None' type sources: VOID and VARIADIC.
+#      Not sure if there is a general way of dealing with them correctly,
+#      so we don't provide any size information for them at the moment.
 def propagateTypeInfo(functions, importer):
-    types = set() # TODO there seem to be two 'None' type sources: VOID and VARIADIC.
+    types = set() #for Type in importer._type_factory.iter_types():
     for function in functions:
         for parameter in function.parameters:
             if parameter.type is None:
@@ -158,8 +161,6 @@ def propagateTypeInfo(functions, importer):
                     logging.warn(f"Type propagation for type {base} yields size 'None'!")
                     continue
                 _type._byte_size = base._byte_size # TODO check correctness
-    #for Type in importer._type_factory.iter_types():
-    #    print(Type)
     return functions
 
 def resolveType(_type):
@@ -213,6 +214,9 @@ def checkLabels(functions):
     for func in functions:
         frame = getMaxFrameSize(func)
         label = generateDebugLabel(func)
+        if any(True for slotSize in label if slotSize is None):
+            logging.warn(f"Function {func.name} has VOID or VARIADIC type stack objects; cannot determine frame size reliably!")
+            continue
         print(f"{func.name} ({frame} by offset / {sum(label)} by size) => {label}")
 
 def isOnStack(variable):
