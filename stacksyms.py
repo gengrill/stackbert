@@ -1,6 +1,6 @@
 import os
 import logging
-logging.basicConfig(format='%(asctime)s %(levelname)s:%(funcName)s:%(message)s',   \
+logging.basicConfig(format='%(asctime)s %(levelname)s:%(funcName)s:%(message)s', \
                     datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO)
 
 # requires pyelftools and pygdbmi, install with "pip3 install pyelftools pygdbmi"
@@ -10,8 +10,8 @@ from elftools.elf.elffile import ELFFile
 # from https://github.com/Vector35/dwarf_import
 from dwarf_import.model.module import Module
 from dwarf_import.model.elements import Function, Component, Parameter, LocalVariable, Location, Type, LocationType, ExprOp
+
 from dwarf_import.io.dwarf_expr import ExprEval, LocExprParser
-#from dwarf_import.io.dwarf_import import create_module_from_ELF_DWARF_file
 from dwarf_import.io.dwarf_import import DWARFDB, DWARFImporter
 from dwarf_import.io.dwarf_import import place_component_in_module_tree
 
@@ -27,26 +27,30 @@ def parseDirectory(dirPath):
     logging.info(f"Found {sum(map(len,functions))} functions total in {len(functions)} files.")
     return fmap
 
-def parseELF(filepath, validateWithGDB=False, gdbmi=None):
+def parseELF(filepath):
     '''Returns a list of functions for this file (if the file contains debug info)'''
     logging.info(f"Trying to parse {filepath} as ELF")
     elf = ELFFile(open(filepath, 'rb'))
     module, importer = parseDWARF(elf)
     functions = getFunctions(module) # a list of model.elements.Function type objects
-    logging.info(f"Found {len(functions)} functions.")
     functions = collectFrameInfo(functions, elf)
     functions = processRegisterRuleExpressions(functions, importer) # process dynamic register locs
     functions = propagateTypeInfo(functions, importer) # element.type.byte_size is None most of the time -> try and fix it
-    if validateWithGDB:
-        # collect the same info we parsed from .eh_frames section for validation
-        _gdbmi  = gdbmi if gdbmi is not None else GdbController() 
-        functions = collectLocals(_gdbmi, functions, filepath)
-        functions = collectDisassembly(_gdbmi, functions, filepath)
-        if gdbmi is None:
-            _gdbmi.exit()
+    return functions
+
+def validateWithGDB(functions, filepath, _gdbmi):
+    '''Collects the same info we parsed from .eh_frames section manually using GDB's output for validation.'''
+    logging.info("Attempting to validate frame size and stack symbolization info using GDB..")
+    if _gdbmi is None:
+        _gdbmi = GdbController() 
+    functions = collectLocals(_gdbmi, functions, filepath)
+    functions = collectDisassembly(_gdbmi, functions, filepath)
+    if _gdbmi is None:
+        _gdbmi.exit()
     return functions
 
 def parseDWARF(elf):
+    # TODO: maybe try and parse frame table even if debug info is missing
     if elf.has_dwarf_info():
         logging.info("File has debug info..")
         module = Module() # this is high-level the data model (no deps on ELF/DWARF types etc)
@@ -67,9 +71,11 @@ def getFunctions(module):
         if type(m) == Component:
             logging.debug(f'Found {len(m.functions)} function definitions in component {m.name}')
             functions += m.functions
+    logging.info(f"Found {len(functions)} functions total.")
     return functions
 
 def collectFrameInfo(functions, elf):
+    '''Parses EH_FRAMES (or DEBUG_FRAMES respectively) to collect the frame table per function'''
     from elftools.dwarf.callframe import ZERO
     dwarfInfo = elf.get_dwarf_info()
     if dwarfInfo.has_EH_CFI():
@@ -89,19 +95,6 @@ def collectFrameInfo(functions, elf):
         return functions
     logging.warn('Does not contain .eh_frames section')
     return functions
-
-def getRegisterSize(arch):
-    if arch == 'x86':
-        return 4
-    elif arch == 'x64':
-        return 8
-    elif arch == 'ARM':
-        return 4
-    elif arch == 'AArch64':
-        return 8
-    elif arch == 'MIPS':
-        return 8
-    raise ValueError(f'unrecognized architecture: {arch}')
 
 def processRegisterRuleExpressions(functions, importer):
     # TODO this is a hack, should be part of the dwar_import processing.. maybe create a patch later
@@ -127,6 +120,15 @@ def processRegisterRuleExpressions(functions, importer):
                         func._registers[regNo] = Register(regNo, describe_reg_name(regNo, func.arch), set())
                     func._registers[regNo].locations.update({loc})
     return functions
+
+def getRegisterSize(arch):
+    return {
+        'x86'     : 4,
+        'x64'     : 8,
+        'ARM'     : 4,
+        'AArch64' : 8,
+        'MIPS'    : 8,
+    }[arch]
 
 # TODO There seem to be two remaining 'None' type sources: VOID and VARIADIC.
 #      Not sure if there is a general way of dealing with them correctly,
@@ -219,28 +221,6 @@ def checkLabels(functions):
             continue
         print(f"{func.name} ({frame} by offset / {sum(label)} by size) => {label}")
 
-def isOnStack(variable):
-    # TODO This should probably be named "isOnStackInInitialFrame" or sth like that.
-    # The goal here is to determine if a dwarf_import.model.elements.Variable is on stack or not
-    # when we enter the first frame of the function.. it's not trivial, we have to determine:
-    # (1) if there is a location at all (could have been optimized out)
-    # (2) if so, whether its _first_ reported location is in the range
-    #     of the first basic block of the function.. otherwise its
-    #     creation is dependent on the function's control flow.
-    # (3) if so, whether the location isn't actually a register.
-    # (4) if so, return the offset from frame base along with its size
-    if len(variable.locations)==0:
-        return False
-    if variable.type == LocationType.STATIC_GLOBAL:
-        return not isInReg(variable)
-    return False
-
-def isInReg(variable): # TODO should be named "isInRegInInitialFrame"
-    initFrameLoc = variable.locations[0]
-    if len(initFrameLoc) == 1:
-        return True # TODO: implement the check
-    return False
-
 # TODO use GDB for validation only -> collect disas somewhere else (where?)
 def collectDisassembly(gdbmi, functions, debugFilepath):
     logging.info('Trying to collect function bodies via GDB..')
@@ -250,6 +230,7 @@ def collectDisassembly(gdbmi, functions, debugFilepath):
         func.disas = [tuple(line.strip().split('\\t')) for line in disas[1:-1]]
     return functions
 
+# collects function locals via GDBs 'info scope function' command
 def collectLocals(gdbmi, functions, debugFilepath):
     logging.info("Trying to collect stack locals via GDB..")
     scopeQueries = [f"info scope {func.name}" for func in functions]
@@ -297,3 +278,27 @@ def staticGDB(gdbmi, filepath, functions, queries):
     for q in queries:
         result += [[msg["payload"] for msg in gdbmi.write(q) if msg["type"]=="console"]]
     return result[1:] # skip meta output
+
+# TODO Unused. At the moment we're not using control flow to improve our heuristic stack frame measure..
+def isOnStack(variable):
+    # TODO This should probably be named "isOnStackInInitialFrame" or sth like that.
+    # The goal here is to determine if a dwarf_import.model.elements.Variable is on stack or not
+    # when we enter the first frame of the function.. it's not trivial, we have to determine:
+    # (1) if there is a location at all (could have been optimized out)
+    # (2) if so, whether its _first_ reported location is in the range
+    #     of the first basic block of the function.. otherwise its
+    #     creation is dependent on the function's control flow.
+    # (3) if so, whether the location isn't actually a register.
+    # (4) if so, return the offset from frame base along with its size
+    if len(variable.locations)==0:
+        return False
+    if variable.type == LocationType.STATIC_GLOBAL:
+        return not isInReg(variable)
+    return False
+
+# TODO Unused. At the moment we're not using control flow to improve our heuristic stack frame measure..
+def isInReg(variable): # TODO should be named "isInRegInInitialFrame"
+    initFrameLoc = variable.locations[0]
+    if len(initFrameLoc) == 1:
+        return True # TODO: implement the check
+    return False
