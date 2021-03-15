@@ -3,6 +3,10 @@ import logging
 logging.basicConfig(format='%(asctime)s %(levelname)s:%(funcName)s:%(message)s', \
                     datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO)
 
+# TODO:
+# BN's DWARF EH_FRAME processing most likely comes from this repo: https://github.com/francesco-zappa-nardelli/eh_frame_check/blob/master/testing/eh_frame_check.py
+# there's some interesting test cases here https://git.tobast.fr/m2-internship/eh_frame_check_setup
+
 # requires pyelftools and pygdbmi, install with "pip3 install pyelftools pygdbmi"
 from pygdbmi.gdbcontroller import GdbController
 from elftools.elf.elffile import ELFFile
