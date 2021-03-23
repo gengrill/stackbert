@@ -7,11 +7,10 @@ logging.basicConfig(format='%(asctime)s %(levelname)s:%(funcName)s:%(message)s',
 # BN's DWARF EH_FRAME processing most likely comes from this repo: https://github.com/francesco-zappa-nardelli/eh_frame_check/blob/master/testing/eh_frame_check.py
 # there's some interesting test cases here https://git.tobast.fr/m2-internship/eh_frame_check_setup
 
-# requires pyelftools and pygdbmi, install with "pip3 install pyelftools pygdbmi"
-from pygdbmi.gdbcontroller import GdbController
+# requires submodules pyelftools and dwarf_import
+#from pygdbmi.gdbcontroller import GdbController
 from elftools.elf.elffile import ELFFile
 
-# from https://github.com/Vector35/dwarf_import
 from dwarf_import.model.module import Module
 from dwarf_import.model.elements import Function, Component, Parameter, LocalVariable, Location, Type, LocationType, ExprOp
 
@@ -32,42 +31,49 @@ def parseDirectory(dirPath):
     return fmap
 
 def parseELF(filepath):
-    '''Returns a list of functions for this file (if the file contains debug info)'''
+    '''Returns a list of functions for this file (if the file contains frame info section)'''
     logging.info(f"Trying to parse {filepath} as ELF")
     elf = ELFFile(open(filepath, 'rb'))
     module, importer = parseDWARF(elf)
-    functions = getFunctions(module) # a list of model.elements.Function type objects
-    functions = collectFrameInfo(functions, elf)
+    functions = getAllFunctions(module, importer, elf) # a list of model.elements.Function type objects
+    frame_tables = collectFrameInfo(functions, elf) # global pc -> FDE dict
+    functions = assign_frames(frame_tables, functions) # split per function
     functions = processRegisterRuleExpressions(functions, importer) # process dynamic register locs
     functions = propagateTypeInfo(functions, importer) # element.type.byte_size is None most of the time -> try and fix it
     return functions
 
-def validateWithGDB(functions, filepath, _gdbmi):
-    '''Collects the same info we parsed from .eh_frames section manually using GDB's output for validation.'''
-    logging.info("Attempting to validate frame size and stack symbolization info using GDB..")
-    if _gdbmi is None:
-        _gdbmi = GdbController() 
-    functions = collectLocals(_gdbmi, functions, filepath)
-    functions = collectDisassembly(_gdbmi, functions, filepath)
-    if _gdbmi is None:
-        _gdbmi.exit()
-    return functions
-
+# TODO: if frame table is indeed missing, try generating it using https://github.com/frdwarf/dwarf-synthesis
 def parseDWARF(elf):
-    # TODO: maybe try and parse frame table even if debug info is missing
-    if elf.has_dwarf_info():
-        logging.info("File has debug info..")
+    '''Look for .eh_frame section and if present, start parsing it (even stripped binaries retain frame info)'''
+    if elf.has_dwarf_info(): # note that this does NOT mean 'has_debug_info()'
+        logging.info("ELF file says it has some frame info..")
         module = Module() # this is high-level the data model (no deps on ELF/DWARF types etc)
         dwarfDB = DWARFDB(elf) # this the io data class for parsing
         importer = DWARFImporter(dwarfDB, dict()) # has state after parsing
         for component in importer.import_components():
             place_component_in_module_tree(module, component)
         return module, importer
-    logging.warn("File does not contain debugging information!")
+    logging.warn("ELF file does not contain any stack frame information!")
     return None
 
+def getAllFunctions(module, importer, elf):
+    '''Returns all functions (including inlined functions).'''
+    Function.arch  = property(lambda self : self._arch) # need this, e.g., for register descriptions
+    Function.is_inline = property(lambda self : self._is_inline)
+    functions = getFunctions(module)
+    inlinedFs = getInlined(functions)
+    logging.info(f"Found {len(inlinedFs)} inlined functions.")
+    for func in functions:
+        func._is_inline = False
+        func._arch = elf.get_machine_arch()
+    for func in inlinedFs:
+        func._is_inline = True
+        func._arch = elf.get_machine_arch()
+    logging.info(f"Returning {len(functions)+len(inlinedFs)} functions total.")
+    return inlinedFs + functions
+
 def getFunctions(module):
-    '''Returns a list of dwarf_import.model.elements.Function objects.'''
+    '''Recursively finds all functions (returns dwarf_import.model.elements.Function objects).'''
     functions = []
     for m in module.children():
         if type(m) == Module:
@@ -75,54 +81,109 @@ def getFunctions(module):
         if type(m) == Component:
             logging.debug(f'Found {len(m.functions)} function definitions in component {m.name}')
             functions += m.functions
-    logging.info(f"Found {len(functions)} functions total.")
+    logging.info(f"Found {len(functions)} function symbols.")
     return functions
 
+# TODO: for some reason, there may be duplicates -> could be bug in dwarf_import?
+def getInlined(functions):
+    '''Recursively finds all inlined functions'''
+    level = [inlined for func in functions for inlined in func.inlined_functions]
+    if not any(level):
+        return functions
+    return level + getInlined(level)
+
 def collectFrameInfo(functions, elf):
-    '''Parses EH_FRAMES (or DEBUG_FRAMES respectively) to collect the frame table per function'''
+    '''Parses EH_FRAMES (or DEBUG_FRAMES respectively) to collect the frame tables (dict keyed by PC values as specified in DWARF Standard Section 6.4.1)'''
     from elftools.dwarf.callframe import ZERO
     dwarfInfo = elf.get_dwarf_info()
-    if dwarfInfo.has_EH_CFI():
+    if dwarfInfo.has_EH_CFI(): # ez
         logging.info('has .eh_frames')
         cfi_entries = dwarfInfo.EH_CFI_entries()
-        for entry in cfi_entries:
+        frame_tables = dict() # pc -> frame description entry (FDE)
+        for entry in cfi_entries: # The frame table is a list of dicts, where integer keys are register numbers for the architecture
             if not type(entry) == ZERO:
                 frame_table = entry.get_decoded().table # elftools.dwarf.callframe.DecodedCallFrameTable
                 if len(frame_table) == 0:
                     logging.warn(f'Empty frame table for entry {entry}!')
                     continue
-                for func in functions: # TODO these two loops take forever.. rewrite as lookup
-                    if any([d for d in frame_table if func.start == d['pc']]):
-                        logging.info(f'Found frame info for function {func.name}.')
-                        func.frame = frame_table
-                        func.arch  = elf.get_machine_arch() # need this, e.g., for register descriptions
-        return functions
-    logging.warn('Does not contain .eh_frames section')
+                for entry in frame_table:
+                    if 'pc' in entry:
+                        if entry['pc'] not in frame_tables:
+                            frame_tables[entry['pc']] = entry
+                        else:
+                            logging.warn(f"DOUBLE ENTRY: {entry}")
+                    else:
+                        logging.warn(f"ENTRY WITHOUT PC: {entry}")
+        return frame_tables
+    logging.warn('Does not contain .eh_frames section') # TODO: what about .debug_frames?
+    return None
+
+def binary_search_function(address, sorted_functions):
+    '''Finds the function among the provided list that best matches the provided address (assuming linearly sorted func.start values and a contiguous code region)'''
+    left = 0
+    right = len(sorted_functions)-1
+    while left <= right:
+        mid = (left + right) // 2
+        if sorted_functions[mid].start < address:
+            left = mid + 1
+        elif address < sorted_functions[mid].start:
+            right = mid - 1
+        else:
+            return sorted_functions[mid]
+    if sorted_functions[right].start <= address:
+        return sorted_functions[right]
+    elif sorted_functions[left].start <= address:
+        return sorted_functions[left]
+    return None
+
+def assign_frames(frame_tables, functions):
+    '''Assigns FDEs from frame_tables dict to functions by address matching fde['pc'] with func.start'''
+    Function.frame_table = property(lambda self : self._frame_table) # dict of FDEs for this function as collected from EH_FRAME section (keyed by pc values)
+    for func in functions:
+        func._frame_table = None
+    sorted_functions = sorted(functions, key=lambda func : func.start) # sort by start pc value once
+    for pc, entry in frame_tables.items():
+        func = binary_search_function(pc, sorted_functions)
+        if func is None:
+            logging.warn(f'No symbol for frame info {entry} at address {pc} (maybe it was inlined?)')
+            continue
+        logging.debug(f'Found frame info for function {func.name}@{pc}.')
+        if func.frame_table is None:
+            func._frame_table = dict()
+        elif pc in func._frame_table:
+            logging.warn(f"DOUBLE ENTRY: {entry} for {func.name}@{pc}!!!")
+            func._frame_table[pc] = [func._frame_table[pc], entry]
+        else:
+            func._frame_table[pc] = entry
     return functions
 
 def processRegisterRuleExpressions(functions, importer):
+    '''Process per function frame tables to create Location objects for all registers stored on the stack'''
     # TODO this is a hack, should be part of the dwar_import processing.. maybe create a patch later
+    # TODO we are missing inlined functions that don't have their own frame table (some do)
     from collections import namedtuple
     from elftools.dwarf.descriptions import describe_reg_name
     Register = namedtuple('Register',['number','name','locations'])
     Register.type = Type(name='Register')
-    Function.registers = property(lambda self : list(self._registers.values()))
-    # The frame table is a list of dicts, where integer keys are register numbers for the architecture.
-    # So we get the register entries and create Location objects on the fly..
+    Function.registers = property(lambda self : list(self._registers.values())) # property for retrieving the locations associated with registers stored on the stack
+    
+    # So we get the register entries and create Location objects on the fly.
     for func in functions:
         Register.type._byte_size = getRegisterSize(func.arch)
         func._registers = dict() # TODO maybe flatten to be just a list of Register objects?
-        for d in func.frame:
-            for regNo, regRule in d.items():
-                if type(regNo)==int:
-                    loc = None
-                    if regRule.type == 'OFFSET': # the tuple here just unifies both cases to [1]
-                        loc = Location(func.start, 0x0, LocationType.STATIC_LOCAL, (0, regRule.arg))
-                    elif regRule.type == 'EXPRESSION':
-                        loc = importer._location_factory.make_location(func.start, 0x0, regRule.arg)
-                    if regNo not in func._registers:
-                        func._registers[regNo] = Register(regNo, describe_reg_name(regNo, func.arch), set())
-                    func._registers[regNo].locations.update({loc})
+        if func.frame_table is not None:
+            for pc in func.frame_table.keys(): # we aggregate locs across all pc values of the function body
+                d = func.frame_table[pc]
+                for regNo, regRule in d.items():
+                    if type(regNo)==int: # only general purpose ('pc' and 'cfa' are not ints)
+                        loc = None
+                        if regRule.type == 'OFFSET': # the tuple here just unifies both cases to [1]
+                            loc = Location(func.start, 0x0, LocationType.STATIC_LOCAL, (0, regRule.arg))
+                        elif regRule.type == 'EXPRESSION':
+                            loc = importer._location_factory.make_location(func.start, 0x0, regRule.arg)
+                        if regNo not in func._registers: # TODO: what about 'DYNAMIC' rules?
+                            func._registers[regNo] = Register(regNo, describe_reg_name(regNo, func.arch), set())
+                        func._registers[regNo].locations.update({loc}) # possibly multiple locs per register (e.g., depending on control flow)
     return functions
 
 def getRegisterSize(arch):
@@ -183,7 +244,10 @@ def getMaxFrameSize(function):
        (gdb) c
        (gdb) info frame
        At this point "frame at 0xADDRESS_A" - "called by frame at 0xADDRESS_B" should match our number below'''
-    return abs(min(map(getMinOff, [function.parameters, function.variables, function.registers])))
+    inlined = [getStackElements(inlined) for inlined in function.inlined_functions]
+    logging.info(f"Got {len(inlined)} inlined functions for {function.name}")
+    possibleStackElements = [function.parameters, function.variables, function.registers]
+    return abs(min(map(getMinOff, possibleStackElements + inlined)))
 
 def getMinOff(stkElms): # minimal stack offset across all elements
     return min([0]+[loc.expr[1] for stkElm in stkElms for loc in getStackLocations(stkElm)])
@@ -224,6 +288,17 @@ def checkLabels(functions):
             logging.warn(f"Function {func.name} has VOID or VARIADIC type stack objects; cannot determine frame size reliably!")
             continue
         print(f"{func.name} ({frame} by offset / {sum(label)} by size) => {label}")
+
+def validateWithGDB(functions, filepath, _gdbmi):
+    '''Collects the same info we parsed from .eh_frames section manually using GDB's output for validation.'''
+    logging.info("Attempting to validate frame size and stack symbolization info using GDB..")
+    if _gdbmi is None:
+        _gdbmi = GdbController() 
+    functions = collectLocals(_gdbmi, functions, filepath)
+    functions = collectDisassembly(_gdbmi, functions, filepath)
+    if _gdbmi is None:
+        _gdbmi.exit()
+    return functions
 
 # TODO use GDB for validation only -> collect disas somewhere else (where?)
 def collectDisassembly(gdbmi, functions, debugFilepath):
