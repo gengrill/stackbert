@@ -1,13 +1,11 @@
+# requires submodules pyelftools and dwarf_import
 import os
 import logging
-logging.basicConfig(format='%(asctime)s %(levelname)s:%(funcName)s:%(message)s', \
-                    datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO)
 
 # TODO:
 # BN's DWARF EH_FRAME processing most likely comes from this repo: https://github.com/francesco-zappa-nardelli/eh_frame_check/blob/master/testing/eh_frame_check.py
 # there's some interesting test cases here https://git.tobast.fr/m2-internship/eh_frame_check_setup
 
-# requires submodules pyelftools and dwarf_import
 #from pygdbmi.gdbcontroller import GdbController
 from elftools.elf.elffile import ELFFile
 
@@ -17,6 +15,11 @@ from dwarf_import.model.elements import Function, Component, Parameter, LocalVar
 from dwarf_import.io.dwarf_expr import ExprEval, LocExprParser
 from dwarf_import.io.dwarf_import import DWARFDB, DWARFImporter
 from dwarf_import.io.dwarf_import import place_component_in_module_tree
+
+logging.basicConfig(
+    format='{asctime} {levelname}:{funcName}:{message}',
+    style="{", datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO
+)
 
 # dwarf_import has:
 #   (1) the io classes which deal with ELF/DWARF stuff,
@@ -69,6 +72,16 @@ def getAllFunctions(module, importer, elf):
     for func in inlinedFs:
         func._is_inline = True
         func._arch = elf.get_machine_arch()
+    for func in inlinedFs: # by default, some inlined functions are missing.. we add them here
+        parent = binary_search_function(func.start, functions)
+        if parent is None:
+            logging.warn(f"Inlined function without parent: {func}")
+            continue
+        if func not in parent.inlined_functions:
+            if parent._inlined_functions == None:
+                parent._inlined_functions = (func,)
+            else:
+                parent._inlined_functions += (func,)
     logging.info(f"Returning {len(functions)+len(inlinedFs)} functions total.")
     return inlinedFs + functions
 
@@ -145,13 +158,13 @@ def assign_frames(frame_tables, functions):
     for pc, entry in frame_tables.items():
         func = binary_search_function(pc, sorted_functions)
         if func is None:
-            logging.warn(f'No symbol for frame info {entry} at address {pc} (maybe it was inlined?)')
+            logging.warn(f'No symbol for frame info {entry} at address {hex(pc)} (maybe it was inlined?)')
             continue
-        logging.debug(f'Found frame info for function {func.name}@{pc}.')
+        logging.debug(f'Found frame info for function {func.name}@{hex(pc)}.')
         if func.frame_table is None:
             func._frame_table = dict()
         elif pc in func._frame_table:
-            logging.warn(f"DOUBLE ENTRY: {entry} for {func.name}@{pc}!!!")
+            logging.warn(f"DOUBLE ENTRY: {entry} for {func.name}@{hex(pc)}!!!")
             func._frame_table[pc] = [func._frame_table[pc], entry]
         else:
             func._frame_table[pc] = entry
@@ -160,14 +173,14 @@ def assign_frames(frame_tables, functions):
 def processRegisterRuleExpressions(functions, importer):
     '''Process per function frame tables to create Location objects for all registers stored on the stack'''
     # TODO this is a hack, should be part of the dwar_import processing.. maybe create a patch later
-    # TODO we are missing inlined functions that don't have their own frame table (some do)
+    # TODO right now, we are missing inlined functions that don't have their own frame table (some do)
     from collections import namedtuple
     from elftools.dwarf.descriptions import describe_reg_name
     Register = namedtuple('Register',['number','name','locations'])
     Register.type = Type(name='Register')
     Function.registers = property(lambda self : list(self._registers.values())) # property for retrieving the locations associated with registers stored on the stack
     
-    # So we get the register entries and create Location objects on the fly.
+    # we get the register entries and create Location objects on the fly.
     for func in functions:
         Register.type._byte_size = getRegisterSize(func.arch)
         func._registers = dict() # TODO maybe flatten to be just a list of Register objects?
@@ -176,12 +189,15 @@ def processRegisterRuleExpressions(functions, importer):
                 d = func.frame_table[pc]
                 for regNo, regRule in d.items():
                     if type(regNo)==int: # only general purpose ('pc' and 'cfa' are not ints)
-                        loc = None
-                        if regRule.type == 'OFFSET': # the tuple here just unifies both cases to [1]
-                            loc = Location(func.start, 0x0, LocationType.STATIC_LOCAL, (0, regRule.arg))
-                        elif regRule.type == 'EXPRESSION':
-                            loc = importer._location_factory.make_location(func.start, 0x0, regRule.arg)
-                        if regNo not in func._registers: # TODO: what about 'DYNAMIC' rules?
+                        loc = None # TODO some locs here cause weird stack layout
+                        if regRule.type == 'OFFSET' or regRule.type == 'VAL_OFFSET': # tuple here just unifies both cases to [1]
+                            loc = Location(pc, 0x0, LocationType.STATIC_LOCAL, (0, regRule.arg))
+                        elif regRule.type == 'EXPRESSION' or regRule.type == 'VAL_EXPRESSION':
+                            loc = importer._location_factory.make_location(pc, 0x0, regRule.arg)
+                        else: # TODO There was a bug here with location start set to func.start isntead of pc.. there may be several more; not clear how to produce location objects correctly from register rules
+                            logging.warn(f"Unknown Register Rule: {regRule}")
+                            loc = Location(pc, 0x0, LocationType.STATIC_LOCAL, (0, regRule.arg))
+                        if regNo not in func._registers:
                             func._registers[regNo] = Register(regNo, describe_reg_name(regNo, func.arch), set())
                         func._registers[regNo].locations.update({loc}) # possibly multiple locs per register (e.g., depending on control flow)
     return functions
@@ -233,6 +249,7 @@ def propagateTypeInfo(functions, importer):
 def resolveType(_type):
     return _type if _type.element is None else resolveType(_type.element)
 
+# TODO: we should probably incorporate 'sub $0x48,%rsp' type instructions here
 def getMaxFrameSize(function):
     '''Get maximum frame size based on its parameter, local, and stored register offsets.
        The number we compute here statically from the .eh_frame section can actually be validated using GDB:
@@ -263,7 +280,7 @@ def generateDebugLabel(func):
 def getStackElements(function):
     '''return stack elements (in no particular order)'''
     candidates = function.parameters + function.variables + function.registers
-    logging.debug(f"Function {function.name} has {len(candidates)} potential stack elements.")
+    logging.debug(f"Function {function.name}@{function.start} has {len(candidates)} potential stack elements.")
     return [stkElm for stkElm in candidates if any(getStackLocations(stkElm))]
 
 def getMinStackOff(stkElm): # minimal stack offset for a single element
@@ -272,9 +289,13 @@ def getMinStackOff(stkElm): # minimal stack offset for a single element
     return min(map(lambda stkLoc : stkLoc.expr[1], stkLocs))
 
 def getStackLocations(stkElm):
+    if None in stkElm.locations:
+        print("BUG!!! NO LOCATIONS FOR: ", stkElm) # TODO I think this should be fixed now
     return [loc for loc in stkElm.locations if locExprHasOffset(loc)]
 
 def locExprHasOffset(location): # TODO y0 d4wg, this sh!t is sketchy as f*&^
+    if not hasattr(location, 'expr'): # TODO: should be fixed now???
+        print(type(location), location)
     if len(location.expr) > 1 and type(location.expr[1]) == int:
         return True
     return False
@@ -308,6 +329,15 @@ def collectDisassembly(gdbmi, functions, debugFilepath):
     for disas, func in zip(gdbOut, functions):
         func.disas = [tuple(line.strip().split('\\t')) for line in disas[1:-1]]
     return functions
+
+def generateDisasFeature(functions):
+    lines = []
+    for func in functions:
+        if 0<len(func.disas):
+            lines += [func.name+'@'+hex(func.start)+':',  ' '.join(map(lambda t : t[1], func.disas))]
+        else:
+            logging.warn(f"Found no disassembly for {func.name}@{func.start} while generating input features!")
+    return lines
 
 # collects function locals via GDBs 'info scope function' command
 def collectLocals(gdbmi, functions, debugFilepath):
