@@ -1,12 +1,15 @@
 # requires submodules pyelftools and dwarf_import
 import os
+import hashlib
+import pdb
 import logging
+import binaryninja
 
 # TODO:
 # BN's DWARF EH_FRAME processing most likely comes from this repo: https://github.com/francesco-zappa-nardelli/eh_frame_check/blob/master/testing/eh_frame_check.py
 # there's some interesting test cases here https://git.tobast.fr/m2-internship/eh_frame_check_setup
 
-#from pygdbmi.gdbcontroller import GdbController
+from pygdbmi.gdbcontroller import GdbController
 from elftools.elf.elffile import ELFFile
 
 from dwarf_import.model.module import Module
@@ -43,6 +46,11 @@ def parseELF(filepath):
     functions = assign_frames(frame_tables, functions) # split per function
     functions = processRegisterRuleExpressions(functions, importer) # process dynamic register locs
     functions = propagateTypeInfo(functions, importer) # element.type.byte_size is None most of the time -> try and fix it
+
+    _gdbmi = GdbController()
+    functions = collectDisassembly(_gdbmi, functions, filepath)
+    _gdbmi.exit()
+
     return functions
 
 # TODO: if frame table is indeed missing, try generating it using https://github.com/frdwarf/dwarf-synthesis
@@ -302,6 +310,7 @@ def locExprHasOffset(location): # TODO y0 d4wg, this sh!t is sketchy as f*&^
 
 # TODO this is just for demonstration purposes
 def checkLabels(functions):
+    allLabels = {}
     for func in functions:
         frame = getMaxFrameSize(func)
         label = generateDebugLabel(func)
@@ -309,6 +318,10 @@ def checkLabels(functions):
             logging.warn(f"Function {func.name} has VOID or VARIADIC type stack objects; cannot determine frame size reliably!")
             continue
         print(f"{func.name} ({frame} by offset / {sum(label)} by size) => {label}")
+        allLabels[func.name] = {}
+        allLabels[func.name]['inp'] = ' '.join(map(lambda t : t[1], func.disas))
+        allLabels[func.name]['out'] = label
+    return allLabels
 
 def validateWithGDB(functions, filepath, _gdbmi):
     '''Collects the same info we parsed from .eh_frames section manually using GDB's output for validation.'''
@@ -320,6 +333,22 @@ def validateWithGDB(functions, filepath, _gdbmi):
     if _gdbmi is None:
         _gdbmi.exit()
     return functions
+
+def collectDisasLabels(functions):
+    allLabels = {}
+    for func in functions:
+        disas = ' '.join(map(lambda t : t[1], func.disas))[:1535]
+        md5 = hashlib.md5(disas.encode()).hexdigest()
+        allLabels[md5] = {}
+        allLabels[md5]['disas'] = disas
+        allLabels[md5]['indices'] = []
+        index = 0
+        for tup in func.disas:
+            sz = len(tup[1].split(' '))
+            allLabels[md5]['indices'].append((index, sz))
+            index += sz
+
+    return allLabels
 
 # TODO use GDB for validation only -> collect disas somewhere else (where?)
 def collectDisassembly(gdbmi, functions, debugFilepath):
