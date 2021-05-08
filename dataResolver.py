@@ -45,5 +45,5 @@ for root, dirs, files in os.walk(args.dataroot):
 with open(os.path.join(args.outputdir, "dataset.json"), "w") as fpw:
     json.dump(allData, fpw)
 
-with open(os.path.join(args.outputdir, "datasetSizes.json", "w") as fpw:
+with open(os.path.join(args.outputdir, "datasetSizes.json"), "w") as fpw:
     json.dump(list(distinctSizes), fpw)

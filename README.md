@@ -24,6 +24,15 @@ Experiments can be replicated using the workflow detailed below.
 * Run `faiseq/scripts/finetune/preprocess.sh` to binarize training data for finetuning (classification) task. Please edit paths in the scripts.
 * Upload generated data in the `data-bin` folder to the `data-bin` folder in the shared drive to use for training.
 
+### Drive
+
+Drive Link: https://drive.google.com/drive/folders/1D2858mxjsNUXV-WIdqvuZNSzfO86ycwZ?usp=sharing
+
+Notebook Link: https://colab.research.google.com/drive/1VVJz8L_GwsDFle-XHUsz5jFtS7CdXi26?usp=sharing
+
+* Trained models are stored in `test_check`.
+* `data-bin` replicates the `data-bin` on disk.
+
 ### Dataset
 
 Dataset used is the same as [EKLAVYA](https://github.com/shensq04/EKLAVYA). Please find it on ava at `/media/VMs/chinmay_dd/varRecovery/otherProjects/EKLAVYA/binary/`. Currently the models are trained on x86 binaries only since that is the target for BinRec 2.0.
