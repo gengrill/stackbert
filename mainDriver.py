@@ -1,6 +1,6 @@
 import os
 import json
-from stacksyms import parseELF, checkLabels, collectDisasLabels
+from stacksyms import parseELF, checkLabels #, collectDisasLabels
 from multiprocessing import Process, Pool, cpu_count
 import argparse
 
@@ -22,13 +22,13 @@ args = parser.parse_args()
 # DATA_DIR = "/media/VMs/chinmay_dd/varRecovery/stacksyms/stacksymruns/collected_data_clang"
 
 if not os.path.exists(args.outputdir):
-    os.mkdir(args.outputdir)
+    os.makedirs(args.outputdir, exist_ok=True)
 
 # Dont analyze clang files since they have positive offset for variable
 # location in DWARF info
 def collector(f):
    try:
-       if args.compiler in f:
+       if args.compiler and args.compiler in f:
            print(f"Skipping file {f}")
            return
 

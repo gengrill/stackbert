@@ -3,7 +3,7 @@ import os
 import hashlib
 import pdb
 import logging
-import binaryninja
+#import binaryninja
 
 # TODO:
 # BN's DWARF EH_FRAME processing most likely comes from this repo: https://github.com/francesco-zappa-nardelli/eh_frame_check/blob/master/testing/eh_frame_check.py
@@ -46,11 +46,7 @@ def parseELF(filepath):
     functions = assign_frames(frame_tables, functions) # split per function
     functions = processRegisterRuleExpressions(functions, importer) # process dynamic register locs
     functions = propagateTypeInfo(functions, importer) # element.type.byte_size is None most of the time -> try and fix it
-
-    _gdbmi = GdbController()
-    functions = collectDisassembly(_gdbmi, functions, filepath)
-    _gdbmi.exit()
-
+    functions = collectDisassemblyObjdump(functions, filepath)
     return functions
 
 # TODO: if frame table is indeed missing, try generating it using https://github.com/frdwarf/dwarf-synthesis
@@ -272,10 +268,13 @@ def getMaxFrameSize(function):
     inlined = [getStackElements(inlined) for inlined in function.inlined_functions]
     logging.info(f"Got {len(inlined)} inlined functions for {function.name}")
     possibleStackElements = [function.parameters, function.variables, function.registers]
-    return abs(min(map(getMinOff, possibleStackElements + inlined)))
+    return max(map(getMinOff, possibleStackElements + inlined))
+    #return abs(min(map(getMinOff, possibleStackElements + inlined)))
 
+# TODO: for LLVM this gets better results than min (check with "git diff --no-index --word-diff=color --word-diff-regex=. new old")
 def getMinOff(stkElms): # minimal stack offset across all elements
-    return min([0]+[loc.expr[1] for stkElm in stkElms for loc in getStackLocations(stkElm)])
+    return max(map(abs,[0]+[loc.expr[1] for stkElm in stkElms for loc in getStackLocations(stkElm)]))
+    #return min([0]+[loc.expr[1] for stkElm in stkElms for loc in getStackLocations(stkElm)])
 
 def generateDebugLabel(func):
     funElms  = len(func.parameters) + len(func.variables) + len(func.registers)
@@ -308,8 +307,8 @@ def locExprHasOffset(location): # TODO y0 d4wg, this sh!t is sketchy as f*&^
         return True
     return False
 
-# TODO this is just for demonstration purposes
 def checkLabels(functions):
+    logging.info(f"Start collecting labels for {len(functions)} functions..")
     allLabels = {}
     for func in functions:
         frame = getMaxFrameSize(func)
@@ -317,11 +316,31 @@ def checkLabels(functions):
         if any(True for slotSize in label if slotSize is None):
             logging.warn(f"Function {func.name} has VOID or VARIADIC type stack objects; cannot determine frame size reliably!")
             continue
-        print(f"{func.name} ({frame} by offset / {sum(label)} by size) => {label}")
+        if 8 < abs(sum(label)-frame): # off by more than 8 bytes
+            logging.warn(f"Label generation for {func.name} is not sound (got {frame} by offset, but {sum(label)} by size)!")
+            continue # TODO: previously, we included these in the training
+        logging.info(f"{func.name} ({frame} by offset / {sum(label)} by size) => {label}")
         allLabels[func.name] = {}
-        allLabels[func.name]['inp'] = ' '.join(map(lambda t : t[1], func.disas))
+        allLabels[func.name]['inp'] = func.disas #' '.join(map(lambda t : t[1], func.disas))
+        allLabels[func.name]['max'] = frame
         allLabels[func.name]['out'] = label
     return allLabels
+
+def collectDisassemblyObjdump(functions, filepath):
+    logging.info('Trying to collect function disassembly via objdump..')
+    import subprocess
+    filedisas = subprocess.getoutput(f"objdump -r -j .text -d {filepath}")
+    for func in functions: # we use awk for cut2 since cut doesn't like Python's TAB insertion
+        function = f"awk -v RS= '/^[[:xdigit:]]+ <{func.name}>/'"
+        cut1, cut2 = "cut -d: -f2", "awk -F'\t' '{print $2}'"
+        proc = subprocess.Popen(' | '.join([function, cut1, cut2]), shell=True, \
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = proc.communicate(input=bytes(filedisas, encoding='utf-8'))
+        if len(err) != 0:
+            logging.warn(f"Error during disassembly of {func.name}: " + err.decode('utf-8'))
+        lines = out.decode('utf-8').strip().split('\n')
+        func.disas = ' '.join(map(lambda s : s.replace(' ', ''), lines))
+    return functions
 
 def validateWithGDB(functions, filepath, _gdbmi):
     '''Collects the same info we parsed from .eh_frames section manually using GDB's output for validation.'''
@@ -334,39 +353,38 @@ def validateWithGDB(functions, filepath, _gdbmi):
         _gdbmi.exit()
     return functions
 
-def collectDisasLabels(functions):
-    allLabels = {}
-    for func in functions:
-        disas = ' '.join(map(lambda t : t[1], func.disas))[:1535]
-        md5 = hashlib.md5(disas.encode()).hexdigest()
-        allLabels[md5] = {}
-        allLabels[md5]['disas'] = disas
-        allLabels[md5]['indices'] = []
-        index = 0
-        for tup in func.disas:
-            sz = len(tup[1].split(' '))
-            allLabels[md5]['indices'].append((index, sz))
-            index += sz
-
-    return allLabels
+# def collectDisasLabels(functions):
+#     allLabels = {}
+#     for func in functions:
+#         disas = ' '.join(map(lambda t : t[1], func.disas))[:1535]
+#         md5 = hashlib.md5(disas.encode()).hexdigest()
+#         allLabels[md5] = {}
+#         allLabels[md5]['disas'] = disas
+#         allLabels[md5]['indices'] = []
+#         index = 0
+#         for tup in func.disas:
+#             sz = len(tup[1].split(' '))
+#             allLabels[md5]['indices'].append((index, sz))
+#             index += sz
+#     return allLabels
 
 # TODO use GDB for validation only -> collect disas somewhere else (where?)
-def collectDisassembly(gdbmi, functions, debugFilepath):
-    logging.info('Trying to collect function bodies via GDB..')
+def collectDisassemblyGDB(gdbmi, functions, debugFilepath):
+    logging.info('Trying to collect function disassembly via GDB..')
     disasQueries = [f'disas /r {func.name}' for func in functions]
     gdbOut = staticGDB(gdbmi, debugFilepath, functions, disasQueries)
     for disas, func in zip(gdbOut, functions):
         func.disas = [tuple(line.strip().split('\\t')) for line in disas[1:-1]]
     return functions
 
-def generateDisasFeature(functions):
-    lines = []
-    for func in functions:
-        if 0<len(func.disas):
-            lines += [func.name+'@'+hex(func.start)+':',  ' '.join(map(lambda t : t[1], func.disas))]
-        else:
-            logging.warn(f"Found no disassembly for {func.name}@{func.start} while generating input features!")
-    return lines
+# def generateDisasFeature(functions):
+#     lines = []
+#     for func in functions:
+#         if 0<len(func.disas):
+#             lines += [func.name+'@'+hex(func.start)+':',  ' '.join(map(lambda t : t[1], func.disas))]
+#         else:
+#             logging.warn(f"Found no disassembly for {func.name}@{func.start} while generating input features!")
+#     return lines
 
 # collects function locals via GDBs 'info scope function' command
 def collectLocals(gdbmi, functions, debugFilepath):
