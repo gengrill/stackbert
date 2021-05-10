@@ -1,15 +1,11 @@
-# requires submodules pyelftools and dwarf_import
+# stacksyms.py: requires submodules pyelftools and dwarf_import
+# The purpose of this tool is to extract function features from
+# unstripped, compiler-generated ELF files. While we don't stricly
+# need debug information (only .eh_frame and .symtab are required)
+# it certainly helps in generating better ground truth information.
 import os
-import hashlib
-import pdb
 import logging
-#import binaryninja
 
-# TODO:
-# BN's DWARF EH_FRAME processing most likely comes from this repo: https://github.com/francesco-zappa-nardelli/eh_frame_check/blob/master/testing/eh_frame_check.py
-# there's some interesting test cases here https://git.tobast.fr/m2-internship/eh_frame_check_setup
-
-from pygdbmi.gdbcontroller import GdbController
 from elftools.elf.elffile import ELFFile
 
 from dwarf_import.model.module import Module
@@ -20,16 +16,21 @@ from dwarf_import.io.dwarf_import import DWARFDB, DWARFImporter
 from dwarf_import.io.dwarf_import import place_component_in_module_tree
 
 logging.basicConfig(
+#    filename='stacksyms_run.log',
     format='{asctime} {levelname}:{funcName}:{message}',
-    style="{", datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO
+    style="{", datefmt='%m/%d/%Y %H:%M:%S', level=logging.DEBUG,
 )
 
-# dwarf_import has:
+# Vector35's dwarf_import library has:
 #   (1) the io classes which deal with ELF/DWARF stuff,
 #   (2) the model classes which are more general, high-level data containers
 #   (3) the parsers themselves which are stateful because DWARF contains stack machines
 # We may need all of the above to get what we want, because some things (like lineprograms)
-# are not implemented in that library (or any other library I looked at).
+# are not implemented in dwarf_import (or any other library I looked at).
+#
+# Vector 35's DWARF EH_FRAME processing most likely comes from this repo:
+# https://github.com/francesco-zappa-nardelli/eh_frame_check/blob/master/testing/eh_frame_check.py
+# there are some interesting test cases here https://git.tobast.fr/m2-internship/eh_frame_check_setup
 
 def parseDirectory(dirPath):
     fmap = {fname : parseELF(dirPath + os.sep + fname) for fname in next(os.walk(dirPath))[2]}
@@ -47,6 +48,7 @@ def parseELF(filepath):
     functions = processRegisterRuleExpressions(functions, importer) # process dynamic register locs
     functions = propagateTypeInfo(functions, importer) # element.type.byte_size is None most of the time -> try and fix it
     functions = collectDisassemblyObjdump(functions, filepath)
+    #functions = collectDisassembly(functions, elf)
     return functions
 
 # TODO: if frame table is indeed missing, try generating it using https://github.com/frdwarf/dwarf-synthesis
@@ -89,15 +91,21 @@ def getAllFunctions(module, importer, elf):
     logging.info(f"Returning {len(functions)+len(inlinedFs)} functions total.")
     return inlinedFs + functions
 
+# TODO I noticed this does a bad job at finding functions for some files, e.g., it
+# only detects 2 functions for "data/cross-compile-dataset/bin/static/gcc/o1/pee".
+# This seems to be a limitation of dwarf_import?
 def getFunctions(module):
     '''Recursively finds all functions (returns dwarf_import.model.elements.Function objects).'''
     functions = []
     for m in module.children():
-        if type(m) == Module:
+        if isinstance(m, Module):
             functions += getFunctions(m)
-        if type(m) == Component:
+        if isinstance(m, Component):
             logging.debug(f'Found {len(m.functions)} function definitions in component {m.name}')
             functions += m.functions
+        else:
+            logging.critical(f'Found module child node that is neither Module or Component, type is {type(m)} ({m})???')
+            loggin.critical(f'{print(dir(m))}')
     logging.info(f"Found {len(functions)} function symbols.")
     return functions
 
@@ -111,28 +119,29 @@ def getInlined(functions):
 
 def collectFrameInfo(functions, elf):
     '''Parses EH_FRAMES (or DEBUG_FRAMES respectively) to collect the frame tables (dict keyed by PC values as specified in DWARF Standard Section 6.4.1)'''
-    from elftools.dwarf.callframe import ZERO
+    from elftools.dwarf.callframe import CIE, FDE, ZERO
     dwarfInfo = elf.get_dwarf_info()
     if dwarfInfo.has_EH_CFI(): # ez
         logging.info('has .eh_frames')
         cfi_entries = dwarfInfo.EH_CFI_entries()
         frame_tables = dict() # pc -> frame description entry (FDE)
         for entry in cfi_entries: # The frame table is a list of dicts, where integer keys are register numbers for the architecture
-            if not type(entry) == ZERO:
-                frame_table = entry.get_decoded().table # elftools.dwarf.callframe.DecodedCallFrameTable
-                if len(frame_table) == 0:
-                    logging.warn(f'Empty frame table for entry {entry}!')
+            if isinstance(entry, FDE):
+                func = [func for func in functions if func.start==entry['initial_location']]
+                if len(func)==0:
+                    logging.warn(f"FDE/CIE for address {entry['initial_location']} without matching symbol.")
                     continue
-                for entry in frame_table:
-                    if 'pc' in entry:
-                        if entry['pc'] not in frame_tables:
-                            frame_tables[entry['pc']] = entry
-                        else:
-                            logging.warn(f"DOUBLE ENTRY: {entry}")
-                    else:
-                        logging.warn(f"ENTRY WITHOUT PC: {entry}")
+                frame_tables[func[0].start] = entry
+                    # for line in decoded_table.table:
+                    #     if 'pc' in line:
+                    #         if line['pc'] not in frame_tables:
+                    #             frame_tables[line['pc']] = entry
+                    #         else:
+                    #             logging.warn(f"DOUBLE ENTRY: {line}")
+                    #     else:
+                    #         logging.warn(f"ENTRY WITHOUT PC: {line}")
         return frame_tables
-    logging.warn('Does not contain .eh_frames section') # TODO: what about .debug_frames?
+    logging.warn('Does not contain .eh_frames section') # TODO: handle .debug_frames
     return None
 
 def binary_search_function(address, sorted_functions):
@@ -158,20 +167,30 @@ def assign_frames(frame_tables, functions):
     Function.frame_table = property(lambda self : self._frame_table) # dict of FDEs for this function as collected from EH_FRAME section (keyed by pc values)
     for func in functions:
         func._frame_table = None
-    sorted_functions = sorted(functions, key=lambda func : func.start) # sort by start pc value once
-    for pc, entry in frame_tables.items():
-        func = binary_search_function(pc, sorted_functions)
-        if func is None:
-            logging.warn(f'No symbol for frame info {entry} at address {hex(pc)} (maybe it was inlined?)')
+        if func.start not in frame_tables:
+            logging.critical(f"No frame table for {func.name}@{func.start}!")
             continue
-        logging.debug(f'Found frame info for function {func.name}@{hex(pc)}.')
-        if func.frame_table is None:
-            func._frame_table = dict()
-        elif pc in func._frame_table:
-            logging.warn(f"DOUBLE ENTRY: {entry} for {func.name}@{hex(pc)}!!!")
-            func._frame_table[pc] = [func._frame_table[pc], entry]
-        else:
-            func._frame_table[pc] = entry
+        entry = frame_tables[func.start]
+        decoded_table = entry.get_decoded() # elftools.dwarf.callframe.DecodedCallFrameTable
+        if len(decoded_table) == 0:
+            logging.warn(f'Frame table for function {func.name} is empty!')
+            continue
+        func._frame_table = decoded_table
+    # FIXME: this can probably go away.. just need it to fix the logic in processRegisterRuleExpressions
+    # sorted_functions = sorted(functions, key=lambda func : func.start) # sort by start pc value once
+    # for pc, entry in frame_tables.items():
+    #     func = binary_search_function(pc, sorted_functions)
+    #     if func is None:
+    #         logging.warn(f'No symbol for frame info {entry} at address {hex(pc)} (maybe it was inlined?)')
+    #         continue
+    #     logging.debug(f'Found frame info for function {func.name}@{hex(pc)}.')
+    #     if func.frame_table is None:
+    #         func._frame_table = dict()
+    #     elif pc in func._frame_table:
+    #         logging.warn(f"DOUBLE ENTRY: {entry} for {func.name}@{hex(pc)}!!!")
+    #         func._frame_table[pc] = [func._frame_table[pc], entry]
+    #     else:
+    #         func._frame_table[pc] = entry
     return functions
 
 def processRegisterRuleExpressions(functions, importer):
@@ -183,27 +202,27 @@ def processRegisterRuleExpressions(functions, importer):
     Register = namedtuple('Register',['number','name','locations'])
     Register.type = Type(name='Register')
     Function.registers = property(lambda self : list(self._registers.values())) # property for retrieving the locations associated with registers stored on the stack
-    
     # we get the register entries and create Location objects on the fly.
     for func in functions:
         Register.type._byte_size = getRegisterSize(func.arch)
         func._registers = dict() # TODO maybe flatten to be just a list of Register objects?
-        if func.frame_table is not None:
-            for pc in func.frame_table.keys(): # we aggregate locs across all pc values of the function body
-                d = func.frame_table[pc]
-                for regNo, regRule in d.items():
-                    if type(regNo)==int: # only general purpose ('pc' and 'cfa' are not ints)
-                        loc = None # TODO some locs here cause weird stack layout
-                        if regRule.type == 'OFFSET' or regRule.type == 'VAL_OFFSET': # tuple here just unifies both cases to [1]
-                            loc = Location(pc, 0x0, LocationType.STATIC_LOCAL, (0, regRule.arg))
-                        elif regRule.type == 'EXPRESSION' or regRule.type == 'VAL_EXPRESSION':
-                            loc = importer._location_factory.make_location(pc, 0x0, regRule.arg)
-                        else: # TODO There was a bug here with location start set to func.start isntead of pc.. there may be several more; not clear how to produce location objects correctly from register rules
-                            logging.warn(f"Unknown Register Rule: {regRule}")
-                            loc = Location(pc, 0x0, LocationType.STATIC_LOCAL, (0, regRule.arg))
-                        if regNo not in func._registers:
-                            func._registers[regNo] = Register(regNo, describe_reg_name(regNo, func.arch), set())
-                        func._registers[regNo].locations.update({loc}) # possibly multiple locs per register (e.g., depending on control flow)
+        # FIXME: this logic is actually broken, needs fixing
+        # if func.frame_table is not None:
+        #     for pc in func.frame_table.keys(): # we aggregate locs across all pc values of the function body
+        #         d = func.frame_table[pc]
+        #         for regNo, regRule in d.items():
+        #             if type(regNo)==int: # only general purpose ('pc' and 'cfa' are not ints)
+        #                 loc = None # TODO some locs here cause weird stack layout
+        #                 if regRule.type == 'OFFSET' or regRule.type == 'VAL_OFFSET': # tuple here just unifies both cases to [1]
+        #                     loc = Location(pc, 0x0, LocationType.STATIC_LOCAL, (0, regRule.arg))
+        #                 elif regRule.type == 'EXPRESSION' or regRule.type == 'VAL_EXPRESSION':
+        #                     loc = importer._location_factory.make_location(pc, 0x0, regRule.arg)
+        #                 else: # TODO There was a bug here with location start set to func.start isntead of pc.. there may be several more; not clear how to produce location objects correctly from register rules
+        #                     logging.info(f"Unknown Register Rule: {regRule}")
+        #                     loc = Location(pc, 0x0, LocationType.STATIC_LOCAL, (0, regRule.arg))
+        #                 if regNo not in func._registers:
+        #                     func._registers[regNo] = Register(regNo, describe_reg_name(regNo, func.arch), set())
+        #                 func._registers[regNo].locations.update({loc}) # possibly multiple locs per register (e.g., depending on control flow)
     return functions
 
 def getRegisterSize(arch):
@@ -253,11 +272,10 @@ def propagateTypeInfo(functions, importer):
 def resolveType(_type):
     return _type if _type.element is None else resolveType(_type.element)
 
-# TODO: we should probably incorporate 'sub $0x48,%rsp' type instructions here
 def getMaxFrameSize(function):
-    '''Get maximum frame size based on its parameter, local, and stored register offsets.
-       The number we compute here statically from the .eh_frame section can actually be validated using GDB:
-       ./gdb path/to/prog
+    '''Get maximum frame size of a function based on its .eh_frame entry.
+       The number we obtain here statically can actually be validated at runtime (e.g, using GDB):
+       $ gdb path/to/prog
        (gdb) set confirmation off
        (gdb) break {func.name}
        (gdb) r
@@ -265,16 +283,21 @@ def getMaxFrameSize(function):
        (gdb) c
        (gdb) info frame
        At this point "frame at 0xADDRESS_A" - "called by frame at 0xADDRESS_B" should match our number below'''
-    inlined = [getStackElements(inlined) for inlined in function.inlined_functions]
-    logging.info(f"Got {len(inlined)} inlined functions for {function.name}")
-    possibleStackElements = [function.parameters, function.variables, function.registers]
-    return max(map(getMinOff, possibleStackElements + inlined))
-    #return abs(min(map(getMinOff, possibleStackElements + inlined)))
+    # TODO: the approach below would require successful symbolization.. but we're not there yet
+    # inlined = [getStackElements(inlined) for inlined in function.inlined_functions]
+    # logging.info(f"Got {len(inlined)} inlined functions for {function.name}")
+    # possibleStackElements = [function.parameters, function.variables, function.registers]
+    # return max(map(getMinOff, possibleStackElements + inlined))
+    # OLD: #return abs(min(map(getMinOff, possibleStackElements + inlined)))
+    if function.frame_table is None:
+        logging.critical(f"Can't compute frame size for {function.name} from empty frame table.. returning zero!")
+        return 0
+    return max(line['cfa'].offset for line in function.frame_table.table)
 
 # TODO: for LLVM this gets better results than min (check with "git diff --no-index --word-diff=color --word-diff-regex=. new old")
-def getMinOff(stkElms): # minimal stack offset across all elements
-    return max(map(abs,[0]+[loc.expr[1] for stkElm in stkElms for loc in getStackLocations(stkElm)]))
-    #return min([0]+[loc.expr[1] for stkElm in stkElms for loc in getStackLocations(stkElm)])
+# def getMinOff(stkElms): # minimal stack offset across all elements
+#    return max(map(abs,[0]+[loc.expr[1] for stkElm in stkElms for loc in getStackLocations(stkElm)]))
+#    #return min([0]+[loc.expr[1] for stkElm in stkElms for loc in getStackLocations(stkElm)])
 
 def generateDebugLabel(func):
     funElms  = len(func.parameters) + len(func.variables) + len(func.registers)
@@ -317,8 +340,8 @@ def checkLabels(functions):
             logging.warn(f"Function {func.name} has VOID or VARIADIC type stack objects; cannot determine frame size reliably!")
             continue
         if 8 < abs(sum(label)-frame): # off by more than 8 bytes
-            logging.warn(f"Label generation for {func.name} is not sound (got {frame} by offset, but {sum(label)} by size)!")
-            continue # TODO: previously, we included these in the training
+            logging.warn(f"Label generation for {func.name} is not sound (got {frame} by offset, but {sum(label)} by size: {label})!")
+            #continue # TODO: previously, we included these in the training
         logging.info(f"{func.name} ({frame} by offset / {sum(label)} by size) => {label}")
         allLabels[func.name] = {}
         allLabels[func.name]['inp'] = func.disas #' '.join(map(lambda t : t[1], func.disas))
@@ -326,13 +349,17 @@ def checkLabels(functions):
         allLabels[func.name]['out'] = label
     return allLabels
 
+def collectDisassembly(functions, filepath):
+    pass
+
 def collectDisassemblyObjdump(functions, filepath):
-    logging.info('Trying to collect function disassembly via objdump..')
     import subprocess
+    logging.info('Trying to collect function disassembly via objdump..')
     filedisas = subprocess.getoutput(f"objdump -r -j .text -d {filepath}")
+    cut1, cut2 = "cut -d: -f2", "awk -F'\t' '{print $2}'"
+    procs = [] # subprocesses run in parallel
     for func in functions: # we use awk for cut2 since cut doesn't like Python's TAB insertion
         function = f"awk -v RS= '/^[[:xdigit:]]+ <{func.name}>/'"
-        cut1, cut2 = "cut -d: -f2", "awk -F'\t' '{print $2}'"
         proc = subprocess.Popen(' | '.join([function, cut1, cut2]), shell=True, \
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         out, err = proc.communicate(input=bytes(filedisas, encoding='utf-8'))
@@ -340,10 +367,38 @@ def collectDisassemblyObjdump(functions, filepath):
             logging.warn(f"Error during disassembly of {func.name}: " + err.decode('utf-8'))
         lines = out.decode('utf-8').strip().split('\n')
         func.disas = ' '.join(map(lambda s : s.replace(' ', ''), lines))
+    for p in procs:
+        p.wait() # wait for all of them before returning
     return functions
 
+# TODO Unused. At the moment we're not using control flow to improve our heuristic stack frame measure..
+def isOnStack(variable):
+    # TODO This should probably be named "isOnStackInInitialFrame" or sth like that.
+    # The goal here is to determine if a dwarf_import.model.elements.Variable is on stack or not
+    # when we enter the first frame of the function.. it's not trivial, we have to determine:
+    # (1) if there is a location at all (could have been optimized out)
+    # (2) if so, whether its _first_ reported location is in the range
+    #     of the first basic block of the function.. otherwise its
+    #     creation is dependent on the function's control flow.
+    # (3) if so, whether the location isn't actually a register.
+    # (4) if so, return the offset from frame base along with its size
+    if len(variable.locations)==0:
+        return False
+    if variable.type == LocationType.STATIC_GLOBAL:
+        return not isInReg(variable)
+    return False
+
+# TODO Unused. At the moment we're not using control flow to improve our heuristic stack frame measure..
+def isInReg(variable): # TODO should be named "isInRegInInitialFrame"
+    initFrameLoc = variable.locations[0]
+    if len(initFrameLoc) == 1:
+        return True # TODO: implement the check
+    return False
+
+# SUPER SLOW: use GDB for validation only
 def validateWithGDB(functions, filepath, _gdbmi):
     '''Collects the same info we parsed from .eh_frames section manually using GDB's output for validation.'''
+    from pygdbmi.gdbcontroller import GdbController
     logging.info("Attempting to validate frame size and stack symbolization info using GDB..")
     if _gdbmi is None:
         _gdbmi = GdbController() 
@@ -353,22 +408,7 @@ def validateWithGDB(functions, filepath, _gdbmi):
         _gdbmi.exit()
     return functions
 
-# def collectDisasLabels(functions):
-#     allLabels = {}
-#     for func in functions:
-#         disas = ' '.join(map(lambda t : t[1], func.disas))[:1535]
-#         md5 = hashlib.md5(disas.encode()).hexdigest()
-#         allLabels[md5] = {}
-#         allLabels[md5]['disas'] = disas
-#         allLabels[md5]['indices'] = []
-#         index = 0
-#         for tup in func.disas:
-#             sz = len(tup[1].split(' '))
-#             allLabels[md5]['indices'].append((index, sz))
-#             index += sz
-#     return allLabels
-
-# TODO use GDB for validation only -> collect disas somewhere else (where?)
+# SUPER SLOW: collect disas from GDB
 def collectDisassemblyGDB(gdbmi, functions, debugFilepath):
     logging.info('Trying to collect function disassembly via GDB..')
     disasQueries = [f'disas /r {func.name}' for func in functions]
@@ -377,17 +417,8 @@ def collectDisassemblyGDB(gdbmi, functions, debugFilepath):
         func.disas = [tuple(line.strip().split('\\t')) for line in disas[1:-1]]
     return functions
 
-# def generateDisasFeature(functions):
-#     lines = []
-#     for func in functions:
-#         if 0<len(func.disas):
-#             lines += [func.name+'@'+hex(func.start)+':',  ' '.join(map(lambda t : t[1], func.disas))]
-#         else:
-#             logging.warn(f"Found no disassembly for {func.name}@{func.start} while generating input features!")
-#     return lines
-
-# collects function locals via GDBs 'info scope function' command
-def collectLocals(gdbmi, functions, debugFilepath):
+# SUPER SLOW: collects function locals via GDBs 'info scope function' command
+def collectLocalsGDB(gdbmi, functions, debugFilepath):
     logging.info("Trying to collect stack locals via GDB..")
     scopeQueries = [f"info scope {func.name}" for func in functions]
     gdbOut = staticGDB(gdbmi, debugFilepath, functions, scopeQueries)
@@ -427,6 +458,7 @@ def collectLocals(gdbmi, functions, debugFilepath):
                 logging.debug("Has stack location!")
     return functions
 
+# SUPER SLOW
 def staticGDB(gdbmi, filepath, functions, queries):
     """Obtains additional info about stack variables from GDB (w/o running the binary)."""
     logging.info(f"Loading {filepath} statically in GDB.")
@@ -434,27 +466,3 @@ def staticGDB(gdbmi, filepath, functions, queries):
     for q in queries:
         result += [[msg["payload"] for msg in gdbmi.write(q) if msg["type"]=="console"]]
     return result[1:] # skip meta output
-
-# TODO Unused. At the moment we're not using control flow to improve our heuristic stack frame measure..
-def isOnStack(variable):
-    # TODO This should probably be named "isOnStackInInitialFrame" or sth like that.
-    # The goal here is to determine if a dwarf_import.model.elements.Variable is on stack or not
-    # when we enter the first frame of the function.. it's not trivial, we have to determine:
-    # (1) if there is a location at all (could have been optimized out)
-    # (2) if so, whether its _first_ reported location is in the range
-    #     of the first basic block of the function.. otherwise its
-    #     creation is dependent on the function's control flow.
-    # (3) if so, whether the location isn't actually a register.
-    # (4) if so, return the offset from frame base along with its size
-    if len(variable.locations)==0:
-        return False
-    if variable.type == LocationType.STATIC_GLOBAL:
-        return not isInReg(variable)
-    return False
-
-# TODO Unused. At the moment we're not using control flow to improve our heuristic stack frame measure..
-def isInReg(variable): # TODO should be named "isInRegInInitialFrame"
-    initFrameLoc = variable.locations[0]
-    if len(initFrameLoc) == 1:
-        return True # TODO: implement the check
-    return False
