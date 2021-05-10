@@ -35,4 +35,8 @@ Notebook Link: https://colab.research.google.com/drive/1VVJz8L_GwsDFle-XHUsz5jFt
 
 ### Dataset
 
-Dataset used is the same as [EKLAVYA](https://github.com/shensq04/EKLAVYA). Please find it on ava at `/media/VMs/chinmay_dd/varRecovery/otherProjects/EKLAVYA/binary/`. Currently the models are trained on x86 binaries only since that is the target for BinRec 2.0.
+Compiler used: GCC: (Ubuntu 5.4.0-6ubuntu1~16.04.4) 5.4.0 20160609
+
+Dataset used for training is the same as [EKLAVYA](https://github.com/shensq04/EKLAVYA). Please find the raw binaries on ava at `/media/VMs/chinmay_dd/varRecovery/data/EKLAVYA/binary/x86`. Currently the models are trained on x86 binaries only since that is the target for BinRec 2.0.
+
+SPEC 2017 binaries compiled with the same compiler can be found at : `/media/VMs/chinmay_dd/varRecovery/data/SPECDATA`
