@@ -7,6 +7,7 @@ import os
 import logging
 
 from elftools.elf.elffile import ELFFile
+from elftools.dwarf.descriptions import describe_reg_name, ExprDumper
 
 from dwarf_import.model.module import Module
 from dwarf_import.model.elements import Function, Component, Parameter, LocalVariable, Location, Type, LocationType, ExprOp
@@ -94,20 +95,32 @@ def getAllFunctions(module, importer, elf):
 # TODO I noticed this does a bad job at finding functions for some files, e.g., it
 # only detects 2 functions for "data/cross-compile-dataset/bin/static/gcc/o1/pee".
 # This seems to be a limitation of dwarf_import?
+# Aha, I think I figured out why.. its because dwarf_import relies on the information
+# provided in the '.debug_ranges' section to find functions. That may however not be
+# very reliable.. I added two options that I think should do a much better job below.
 def getFunctions(module):
     '''Recursively finds all functions (returns dwarf_import.model.elements.Function objects).'''
     functions = []
+    logging.info(f'Trying to identify subroutine definitions present in binary..')
     for m in module.children():
         if isinstance(m, Module):
+            logging.debug(f'Recursing into module {m}')
             functions += getFunctions(m)
-        if isinstance(m, Component):
+        elif isinstance(m, Component):
+            #place_component_in_module_tree(module, m)
             logging.debug(f'Found {len(m.functions)} function definitions in component {m.name}')
             functions += m.functions
         else:
             logging.critical(f'Found module child node that is neither Module or Component, type is {type(m)} ({m})???')
-            loggin.critical(f'{print(dir(m))}')
+            logging.critical(f'{print(dir(m))}')
+    # TODO: we should add two additional sources for subroutines here
+    # (1) from the .symtab section (that one even has symbol names)
+    # (2) from the .eh_frame section (no names but frame size and address ranges)
     logging.info(f"Found {len(functions)} function symbols.")
     return functions
+
+def getFunctionsSymtab(functions, elf):
+    pass
 
 # TODO: for some reason, there may be duplicates -> could be bug in dwarf_import?
 def getInlined(functions):
@@ -126,7 +139,7 @@ def collectFrameInfo(functions, elf):
         cfi_entries = dwarfInfo.EH_CFI_entries()
         frame_tables = dict() # pc -> frame description entry (FDE)
         for entry in cfi_entries: # The frame table is a list of dicts, where integer keys are register numbers for the architecture
-            if isinstance(entry, FDE):
+            if isinstance(entry, FDE): # CIE's don't specify initial locations, only FDE's do
                 func = [func for func in functions if func.start==entry['initial_location']]
                 if len(func)==0:
                     logging.warn(f"FDE/CIE for address {entry['initial_location']} without matching symbol.")
@@ -175,7 +188,7 @@ def assign_frames(frame_tables, functions):
         if len(decoded_table) == 0:
             logging.warn(f'Frame table for function {func.name} is empty!')
             continue
-        func._frame_table = decoded_table
+        func._frame_table = entry
     # FIXME: this can probably go away.. just need it to fix the logic in processRegisterRuleExpressions
     # sorted_functions = sorted(functions, key=lambda func : func.start) # sort by start pc value once
     # for pc, entry in frame_tables.items():
@@ -198,7 +211,6 @@ def processRegisterRuleExpressions(functions, importer):
     # TODO this is a hack, should be part of the dwar_import processing.. maybe create a patch later
     # TODO right now, we are missing inlined functions that don't have their own frame table (some do)
     from collections import namedtuple
-    from elftools.dwarf.descriptions import describe_reg_name
     Register = namedtuple('Register',['number','name','locations'])
     Register.type = Type(name='Register')
     Function.registers = property(lambda self : list(self._registers.values())) # property for retrieving the locations associated with registers stored on the stack
@@ -283,16 +295,26 @@ def getMaxFrameSize(function):
        (gdb) c
        (gdb) info frame
        At this point "frame at 0xADDRESS_A" - "called by frame at 0xADDRESS_B" should match our number below'''
-    # TODO: the approach below would require successful symbolization.. but we're not there yet
+    # TODO: the approach in comments here would require successful symbolization.. but we're not there yet
     # inlined = [getStackElements(inlined) for inlined in function.inlined_functions]
     # logging.info(f"Got {len(inlined)} inlined functions for {function.name}")
     # possibleStackElements = [function.parameters, function.variables, function.registers]
-    # return max(map(getMinOff, possibleStackElements + inlined))
+    # return max(map(abs,map(getMinOff, possibleStackElements + inlined)))
     # OLD: #return abs(min(map(getMinOff, possibleStackElements + inlined)))
     if function.frame_table is None:
         logging.critical(f"Can't compute frame size for {function.name} from empty frame table.. returning zero!")
         return 0
-    return max(line['cfa'].offset for line in function.frame_table.table)
+    cfa_rules = [line['cfa'] for line in function.frame_table.get_decoded().table]
+    cfa_rules_with_exprs = list(filter(lambda cfar : cfar.expr is not None, cfa_rules))
+    if any(cfa_rules_with_exprs): # TODO it seems to be rare, but we might be skipping over offsets here? Logging..
+        logging.info("Binary contains register rule expressions for canonical frame address, skipping expressions:")
+        ra_regnum = function.frame_table.cie['return_address_register']
+        logging.info(f"return address resides in register {ra_regnum} ({describe_reg_name(ra_regnum, function.arch)}")
+        expr_dumper = ExprDumper(function.frame_table.structs)
+        for cfar in cfa_rules_with_exprs:
+            logging.info(f"Skipping Expression: {expr_dumper.dump_expr(cfar.expr)}")
+            cfa_rules.remove(cfar)
+    return max(cfa.offset for cfa in cfa_rules)
 
 # TODO: for LLVM this gets better results than min (check with "git diff --no-index --word-diff=color --word-diff-regex=. new old")
 # def getMinOff(stkElms): # minimal stack offset across all elements
