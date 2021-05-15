@@ -49,7 +49,6 @@ def parseELF(filepath):
     func_dict = assign_frames(frame_tables, func_dict) # split per function
     func_dict = processRegisterRuleExpressions(func_dict, importer) # process dynamic register locs
     func_dict = propagateTypeInfo(func_dict, importer) # element.type.byte_size is often None -> try and fix it
-    #func_dict = collectDisassemblyObjdump(func_dict, filepath)
     func_dict = collectOpcodes(func_dict, elf)
     return func_dict.values()
 
@@ -60,28 +59,28 @@ def parseDWARF(elf):
         logging.info("ELF file says it has some frame info..")
         module = Module() # this is high-level the data model (no deps on ELF/DWARF types etc)
         dwarfDB = DWARFDB(elf) # this the io data class for parsing
-        importer = DWARFImporter(dwarfDB, {'only_concrete_subprograms' : False}) # has state after parsing
+        importer = DWARFImporter(dwarfDB, dict()) # {'only_concrete_subprograms' : False})
         for component in importer.import_components():
             place_component_in_module_tree(module, component)
-        return module, importer
+        return module, importer # importer has state after parsing
     logging.warn("ELF file does not contain any stack frame information!")
     return None
 
-# I noticed this does a bad job at finding functions for some files, e.g., it
-# only detects 2 functions for "data/cross-compile-dataset/bin/static/gcc/o1/pee".
+# I noticed this used to do a bad job at finding functions for some files, e.g., it
+# only detected 2 functions for "data/cross-compile-dataset/bin/static/gcc/o1/pee".
 # This seems to be a limitation of dwarf_import, because it relies on the information
-# provided in the '.debug_ranges' section to find function's addresses. That may however
-# not be very reliable.. I added two alternatives that I think should do a better job below.
-# Also, I changed the "is_concrete" requirement as a default import setting in DWARFImporter
-# which at least results in 13 functions being imported from the dwarf info (cf. only 2).
+# provided in the '.debug_info' section to find functions. That may however not be very
+# reliable.. I added two alternatives that I think should do a better job below.
+# If we also change the "is_concrete" requirement as a default import setting for DWARFImporter
+# it will import 13 functions (as opposed to 2) but curiously miss start address and size info.
 def getAllFunctions(module, importer, elf):
     '''Returns all functions (including inlined functions) as dwarf_import.model.elements.Function objects.'''
     Function.is_inline = property(lambda self : self._is_inline)
-    # (1) from the .symtab section (that one even has symbol names)
+    # (1) from the .symtab section (name, address, and size only)
     func_dict = getFunctionsFromSymtab(elf)
     # TODO: (2) from the .eh_frame section (no names but frame size and address ranges)
-     # this uses 'DW_TAG_subprogram' -> might have missing .start
-    #func_dict = getFunctionsFromDWARFInfo(func_dict, module)
+    # (3) from .debug_info using 'DW_TAG_subprogram' (can miss .start if only_concrete_subprograms=False)
+    func_dict = getFunctionsFromDWARFInfo(func_dict, module)
     #TODO: inlinedFs = getInlined(functions)
     '''logging.info(f"Found {len(inlinedFs)} inlined functions.")
     for func in func_dict.values():
@@ -106,14 +105,14 @@ def getAllFunctions(module, importer, elf):
     return func_dict
 
 def getFunctionsFromSymtab(elf):
-    '''This gets both local and global symbols.'''
+    '''Get both local and global symbols from .symtab section.'''
     logging.info('Trying to obtain symbol information.')
     Function.arch  = property(lambda self : self._arch) # some archs have multiple ISAs (e.g., ARM/THUMB)
     Function.size  = property(lambda self : self._size) # size in bytes
     func_dict = dict()
     symtab = elf.get_section_by_name('.symtab')
     if symtab is None:
-        logging.warn("No .symtab section!")
+        logging.critical("Missing .symtab section!")
         return func_dict
     for i, symbol in enumerate(symtab.iter_symbols()):
         if symbol['st_info']['type']=='STT_FUNC':
@@ -127,23 +126,36 @@ def getFunctionsFromSymtab(elf):
 
 def getFunctionsFromDWARFInfo(func_dict, module):
     '''Recursively finds functions using 'DW_TAG_subprogram'.'''
-    logging.info(f'Trying to identify subroutine definitions present in binary..')
+    logging.info(f'Searching for subroutines with explicit DWARF info..')
     for m in module.children():
         if isinstance(m, Module):
             logging.debug(f'Recursing into module {m}')
-            new_funcs = getFunctions(m)
-            for func in new_funcs:
-                # TODO
-                pass
+            getFunctionsFromDWARFInfo(func_dict, m)
         elif isinstance(m, Component):
-            #place_component_in_module_tree(module, m)
             logging.debug(f'Found {len(m.functions)} function definitions in component {m.name}')
-            functions += m.functions
+            func_dict = mergeSymtabDWARF(func_dict, m.functions)
         else:
-            logging.critical(f'Found module child node that is neither Module or Component, type is {type(m)} ({m})???')
-            logging.critical(f'{print(dir(m))}')
-    logging.info(f"Found {len(functions)} function symbols.")
-    return functions
+            logging.critical(f'Child node is neither Module nor Component ({type(m), m}).')
+    return func_dict
+
+def mergeSymtabDWARF(symtab_funcs, dwarf_funcs):
+    for dwarf_func in dwarf_funcs:
+        if dwarf_func.start is None: # try to match it by name
+            for symtab_func in symtab_funcs.values():
+                if symtab_func.name == dwarf_func.name:
+                    logging.debug(f'Found missing address from symtab info for {dwarf_func.name}.')
+                    dwarf_func.start = symtab_func.start
+                    break
+            logging.info(f'Skipping abstract function {dwarf_func.name} (missing address).')
+            continue
+        if dwarf_func.start in symtab_funcs: # merge symtab and DWARF symbols by address
+            logging.debug(f'Merging symtab and dwarf info for {dwarf_func.name}@{hex(dwarf_func.start)}.')
+            symtab_func = symtab_funcs[dwarf_func.start]
+            dwarf_func._size  = symtab_func.size
+            dwarf_func._arch  = symtab_func.arch
+            symtab_funcs[dwarf_func.start] = dwarf_func
+            del symtab_func
+    return symtab_funcs
 
 # TODO: for some reason, there may be duplicates -> could be bug in dwarf_import?
 def getInlined(functions):
