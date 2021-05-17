@@ -1,6 +1,19 @@
 Machine Learning for Runtime Stack Size Estimation
 ---
 
+### Obtaining groundtruth labels
+Both LLVM and GCC provide builtin solutions to obtain per-function stack frame sizes during compilation:
+```
+$ gcc data/input.c -o data/gcc-input -fstack-usage
+$ less input.su
+```
+and
+```
+$ clang data/input.c -o data/clang-input -fstack-size-section
+$ llvm-readelf --stack-sizes data/clang-input
+```
+This represents the recommended way of obtaining labeled data. However, we also provide tools to obtain ground truth labels from pre-compiled binaries (cf., stacksyms.py). This requires that the binary contains both (i) a symbol table (i.e., a .symtab section), and (ii) call frame information (i.e., an .eh_frames section) as a bare minimum, otherwise function identification and frame calculation will fail. While a debug build is not strictly required, results will usually be better if debug information is present (e.g., because of additional type information).
+
 ### Code
 
 Experiments can be replicated using the workflow detailed below.
