@@ -445,8 +445,9 @@ def generateDebugLabel(func):
 # FIXME for some reason Location.pc may be 0 for some local variables, even if line['pc'] is nonzero
 def getStackElements(function):
     '''return stack elements (in no particular order)'''
-    regs = [reg for reg in function.registers if reg.number != 'cfa']
-    candidates = function.parameters + function.variables + regs
+    # TODO currently, we use 'cfa' as the return address element.. requires further testing (e.g., on ARM)
+    #regs = [reg for reg in function.registers if reg.number != 'cfa']
+    candidates = function.parameters + function.variables + function.registers
     logging.debug(f"Function {function.name}@{function.start} has {len(candidates)} potential stack elements.")
     return [stkElm for stkElm in candidates if any(getStackLocations(stkElm))]
 
