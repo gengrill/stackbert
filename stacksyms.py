@@ -479,7 +479,7 @@ def checkLabels(functions):
             #continue # TODO: previously, we included these in the training
         logging.info(f"{func.name} ({frame} by offset / {sum(label)} by size) => {label}")
         allLabels[func.name] = {}
-        allLabels[func.name]['inp'] = func.code #' '.join(map(lambda t : t[1], func.code))
+        allLabels[func.name]['inp'] = ' '.join([func.code[i:i+2] for i in range(0, len(func.code), 2)])
         allLabels[func.name]['max'] = frame
         allLabels[func.name]['out'] = label
     return allLabels

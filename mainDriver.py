@@ -28,7 +28,7 @@ if not os.path.exists(args.outputdir):
 # location in DWARF info
 def collector(f):
    try:
-       if args.compiler and args.compiler in f:
+       if args.compiler and args.compiler not in f:
            print(f"Skipping file {f}")
            return
 
