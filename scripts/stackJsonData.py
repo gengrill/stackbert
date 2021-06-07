@@ -1,10 +1,9 @@
-#!/home/chinmay/Projects/scratch/var/bin/python
-
 import sys
-sys.path.append("/home/chinmay/Projects/scratch/var/lib/python3.8/site-packages")
+# sys.path.append("/home/chinmay/Projects/scratch/var/lib/python3.8/site-packages")
 
 import json
 import rzpipe
+# Requires rizin and rzpipe installed
 import pdb
 import os
 
@@ -12,11 +11,12 @@ import argparse
 
 parser = argparse.ArgumentParser(description='Collect data for pin')
 parser.add_argument('--file', metavar='F', 
-        type=str, help='File path')
+        type=str, help='Input binary path')
+parser.add_argument('--output', metavar='O', 
+        type=str, help='Output file path')
 
 args = parser.parse_args()
 
-# TODO: Replace all instances of esp and eip with rsp and rip if target is 64 bits
 file_path = args.file
 file_name = file_path.split(os.sep)[-1]
 pipe = rzpipe.open(file_path)
@@ -24,7 +24,7 @@ pipe.cmd("aa")
 
 address_map = {}
 
-with open(f"addrs-{file_name}.txt", "w") as fp:
+with open(args.output, "w") as fp:
     all_funcs = pipe.cmdj("aflj")
     for func in all_funcs:
         func_name = func['name']
@@ -38,3 +38,4 @@ with open(f"addrs-{file_name}.txt", "w") as fp:
             all_instrs = pipe.cmdj(f"pdfj @ {func_name}")
             for instr in all_instrs["ops"]:
                 fp.write("2 " + str(instr["offset"]) + "\n")
+            fp.write("3 " + func_name + "\n")

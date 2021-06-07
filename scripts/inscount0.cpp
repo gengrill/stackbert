@@ -40,8 +40,15 @@ map<ADDRINT, set<ADDRINT>> boundaryAddrs;
 map<ADDRINT, set<ADDRINT>> interestingFunctionAddrs;
 map<ADDRINT, bool> exitAddrs;
 map<ADDRINT, UINT32> maxObservedSize;
+map<ADDRINT, string> funcNames;
 
 stack<CallStackEntry> callStack;
+
+KNOB<string> KnobOutputFile(KNOB_MODE_WRITEONCE, "pintool",
+    "o", "stackSizes.out", "specify output file name");
+
+KNOB<string> KnobInputFile(KNOB_MODE_WRITEONCE, "pintool",
+    "i", "addrs.txt", "specify input file name");
 
 // This function is called before every instruction is executed
 static VOID addStackUpdateEntry(ADDRINT ip, ADDRINT sp) { 
@@ -70,6 +77,7 @@ static VOID updateCallStackAtEntry(ADDRINT ip, ADDRINT sp) {
 
     callStack.push(entry);
     // cerr << std::hex << ip << endl;
+    // cerr << callStack.size() << endl;
 }
 
 static VOID updateCallStackAtExit(ADDRINT ip, ADDRINT sp) {
@@ -113,42 +121,46 @@ VOID StackMonitor(INS ins, VOID *v)
 
 VOID CallMonitor(INS ins, VOID *v) {
     ADDRINT ip = INS_Address(ins);
+
     auto foundEntry = boundaryAddrs.find(ip);
     if (foundEntry != boundaryAddrs.end()) {
         INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)updateCallStackAtEntry, IARG_REG_VALUE, REG_EIP, IARG_REG_VALUE, REG_STACK_PTR, IARG_END);
-    } else {
-        auto foundExit = exitAddrs.find(ip);
-        if (foundExit != exitAddrs.end()) {
-            INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)updateCallStackAtExit, IARG_REG_VALUE, REG_EIP, IARG_REG_VALUE, REG_STACK_PTR, IARG_END);
-        }
+    } 
+        
+    // For some functions which have a single instruction, we need to ensure that we remove them off the callstack
+    // as soon as they are added
+    auto foundExit = exitAddrs.find(ip);
+    if (foundExit != exitAddrs.end()) {
+        INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)updateCallStackAtExit, IARG_REG_VALUE, REG_EIP, IARG_REG_VALUE, REG_STACK_PTR, IARG_END);
     }
 }
 
 VOID ParseAddrs() {
-    string line;
+    string line, name;
     UINT32 entryAddr, exitAddr, memberAddr;
-    ADDRINT addr, flag;
+    ADDRINT flag;
 
-    std::ifstream infile("/home/chinmay/Projects/scratch/addrs-mcf_r_base.binrec-m32-O0.txt");
-    // std::ifstream infile("/home/chinmay/Projects/scratch/addrs-a.out.txt");
+    std::ifstream infile(KnobInputFile.Value().c_str());
     while (std::getline(infile, line)) {
         istringstream temp(line, istringstream::in);
         temp >> flag;
-        temp >> addr;
         
         if (flag == 0) {
+            temp >> entryAddr;
             // cerr << "Entry: " << std::hex << entryAddr << endl;
-            entryAddr = addr;
             boundaryAddrs[entryAddr] = set<UINT32>();
             interestingFunctionAddrs[entryAddr] = set<UINT32>();
         } else if (flag == 1) {
+            temp >> exitAddr;
             // cerr << "Exit: " << std::hex << exitAddr << endl;
-            exitAddr = addr;
             boundaryAddrs[entryAddr].insert(exitAddr);
             exitAddrs[exitAddr] = true;
         } else if (flag == 2) {
-            memberAddr = addr;
+            temp >> memberAddr;
             interestingFunctionAddrs[entryAddr].insert(memberAddr);
+        } else if (flag == 3) {
+            temp >> name;
+            funcNames[entryAddr] = name;
         }
     }
 
@@ -157,17 +169,18 @@ VOID ParseAddrs() {
     cerr << "======================" << endl;
 }
 
-KNOB<string> KnobOutputFile(KNOB_MODE_WRITEONCE, "pintool",
-    "o", "inscount.out", "specify output file name");
-
 // This function is called when the application exits
 VOID Fini(INT32 code, VOID *v)
 {
+    ofstream result;
+    result.open(KnobOutputFile.Value().c_str());
+    for (auto& addrPair : maxObservedSize) {
+        result << funcNames[addrPair.first] << ":" << addrPair.second << endl;
+    }
+    result.close();
+
     cerr << "======================" << endl;
     cerr << "Execution done" << endl;
-    for (auto& addrPair : maxObservedSize) {
-        cerr << std::hex << addrPair.first << ":" << std::hex << addrPair.second << endl;
-    }
     cerr << "======================" << endl;
 }
 
@@ -178,7 +191,7 @@ VOID Fini(INT32 code, VOID *v)
 INT32 Usage()
 {
     cerr << "This tool counts max stack runtime stack size per function." << endl;
-    // cerr << endl << KNOB_BASE::StringKnobSummary() << endl;
+    cerr << endl << KNOB_BASE::StringKnobSummary() << endl;
     return -1;
 }
 
@@ -192,8 +205,6 @@ int main(int argc, char * argv[])
 {
     // Initialize pin
     if (PIN_Init(argc, argv)) return Usage();
-
-    OutFile.open(KnobOutputFile.Value().c_str());
 
     // Register StackMonitor to be called when checking stack updates
     INS_AddInstrumentFunction(StackMonitor, 0);
