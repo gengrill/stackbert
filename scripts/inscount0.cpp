@@ -31,15 +31,15 @@ using std::stack;
 ofstream OutFile;
 
 typedef struct {
-    UINT32 entryAddr;
-    UINT32 espEntry;
-    UINT32 maxDiff;
+    ADDRINT entryAddr;
+    ADDRINT espEntry;
+    int maxDiff;
 } CallStackEntry;
 
 map<ADDRINT, set<ADDRINT>> boundaryAddrs;
 map<ADDRINT, set<ADDRINT>> interestingFunctionAddrs;
 map<ADDRINT, bool> exitAddrs;
-map<ADDRINT, UINT32> maxObservedSize;
+map<ADDRINT, int> maxObservedSize;
 map<ADDRINT, string> funcNames;
 
 stack<CallStackEntry> callStack;
@@ -64,9 +64,9 @@ static VOID addStackUpdateEntry(ADDRINT ip, ADDRINT sp) {
         return;
     }
 
-    UINT32 currentDiff = topEntry.espEntry - sp;
+    int currentDiff = topEntry.espEntry - sp;
     topEntry.maxDiff = std::max(topEntry.maxDiff, currentDiff);
-    // cerr << std::hex << ip << ":" << std::hex << topEntry.maxDiff << endl;
+    // cerr << std::hex << ip << ":" << std::dec << topEntry.maxDiff << endl;
 }
 
 static VOID updateCallStackAtEntry(ADDRINT ip, ADDRINT sp) {
@@ -76,8 +76,9 @@ static VOID updateCallStackAtEntry(ADDRINT ip, ADDRINT sp) {
     entry.maxDiff = 0;
 
     callStack.push(entry);
+    // cerr << "Entry into : " << std::hex << ip << endl;
     // cerr << std::hex << ip << endl;
-    // cerr << callStack.size() << endl;
+    // cerr << "** " << callStack.size() << " **" << endl;
 }
 
 static VOID updateCallStackAtExit(ADDRINT ip, ADDRINT sp) {
@@ -87,7 +88,10 @@ static VOID updateCallStackAtExit(ADDRINT ip, ADDRINT sp) {
 
     auto topEntry = callStack.top();
     auto foundExit = boundaryAddrs[topEntry.entryAddr].find(ip);
+    // cerr << std::hex << topEntry.entryAddr << endl;
     if (foundExit == boundaryAddrs[topEntry.entryAddr].end()) {
+        // cerr << "0x" << std::hex << ip << ": 0x" << topEntry.entryAddr << endl;
+        // exit(0);
         return;
     }
 
@@ -98,6 +102,11 @@ static VOID updateCallStackAtExit(ADDRINT ip, ADDRINT sp) {
         maxObservedSize[topEntry.entryAddr] = topEntry.maxDiff;
     }
     callStack.pop();
+    // if (topEntry.entryAddr == 0x814077b) {
+    //     cerr << std::hex << ip << endl;
+    // }
+
+    // cerr << "Exit from : " << std::hex << topEntry.entryAddr << endl;
 }
 
 // Pin calls this function every time a new instruction is encountered
@@ -115,7 +124,7 @@ VOID StackMonitor(INS ins, VOID *v)
 
         // cerr << std::hex << INS_Address(ins) << endl;
 
-        INS_InsertCall(ins, where, (AFUNPTR)addStackUpdateEntry, IARG_REG_VALUE, REG_EIP, IARG_REG_VALUE, REG_STACK_PTR, IARG_END);
+        INS_InsertCall(ins, where, (AFUNPTR)addStackUpdateEntry, IARG_REG_VALUE, REG_INST_PTR, IARG_REG_VALUE, REG_STACK_PTR, IARG_END);
     }
 }
 
@@ -124,20 +133,20 @@ VOID CallMonitor(INS ins, VOID *v) {
 
     auto foundEntry = boundaryAddrs.find(ip);
     if (foundEntry != boundaryAddrs.end()) {
-        INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)updateCallStackAtEntry, IARG_REG_VALUE, REG_EIP, IARG_REG_VALUE, REG_STACK_PTR, IARG_END);
-    } 
+        INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)updateCallStackAtEntry, IARG_REG_VALUE, REG_INST_PTR, IARG_REG_VALUE, REG_STACK_PTR, IARG_END);
+    }
         
     // For some functions which have a single instruction, we need to ensure that we remove them off the callstack
     // as soon as they are added
     auto foundExit = exitAddrs.find(ip);
     if (foundExit != exitAddrs.end()) {
-        INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)updateCallStackAtExit, IARG_REG_VALUE, REG_EIP, IARG_REG_VALUE, REG_STACK_PTR, IARG_END);
+        INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)updateCallStackAtExit, IARG_REG_VALUE, REG_INST_PTR, IARG_REG_VALUE, REG_STACK_PTR, IARG_END);
     }
 }
 
 VOID ParseAddrs() {
     string line, name;
-    UINT32 entryAddr, exitAddr, memberAddr;
+    ADDRINT entryAddr, exitAddr, memberAddr;
     ADDRINT flag;
 
     std::ifstream infile(KnobInputFile.Value().c_str());
@@ -148,8 +157,8 @@ VOID ParseAddrs() {
         if (flag == 0) {
             temp >> entryAddr;
             // cerr << "Entry: " << std::hex << entryAddr << endl;
-            boundaryAddrs[entryAddr] = set<UINT32>();
-            interestingFunctionAddrs[entryAddr] = set<UINT32>();
+            boundaryAddrs[entryAddr] = set<ADDRINT>();
+            interestingFunctionAddrs[entryAddr] = set<ADDRINT>();
         } else if (flag == 1) {
             temp >> exitAddr;
             // cerr << "Exit: " << std::hex << exitAddr << endl;

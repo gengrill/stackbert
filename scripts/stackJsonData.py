@@ -1,9 +1,10 @@
+#!/home/chinmay/Projects/scratch/var/bin/python
+
 import sys
-# sys.path.append("/home/chinmay/Projects/scratch/var/lib/python3.8/site-packages")
+sys.path.append("/home/chinmay/Projects/scratch/var/lib/python3.8/site-packages")
 
 import json
 import rzpipe
-# Requires rizin and rzpipe installed
 import pdb
 import os
 
@@ -24,6 +25,16 @@ pipe.cmd("aa")
 
 address_map = {}
 
+# def get_exit_addrs(func_name):
+#     exit_addrs = []
+#     fn_info = pipe.cmdj(f"afbj @ {func_name}")
+#     for bb in fn_info:
+#         if bb["outputs"] == 0:  # Check if outputs are 0
+#             addr = bb["addr"]
+#             bb_info = pipe.cmdj(f"pdbj @ {addr}")
+#             exit_addrs.append(bb_info[-1]["offset"])
+#     return exit_addrs
+
 with open(args.output, "w") as fp:
     all_funcs = pipe.cmdj("aflj")
     for func in all_funcs:
@@ -33,6 +44,7 @@ with open(args.output, "w") as fp:
                 continue
             fp.write("0 " + str(func["offset"]) + "\n")
             exit_addrs = [int(x, 16) for x in pipe.cmd(f"afbr @ {func_name}").split("\n")[:-1]]
+            # exit_addrs = get_exit_addrs(func_name)
             for exit_addr in exit_addrs:
                 fp.write("1 " + str(exit_addr) + "\n")
             all_instrs = pipe.cmdj(f"pdfj @ {func_name}")
