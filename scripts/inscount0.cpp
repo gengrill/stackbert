@@ -41,6 +41,7 @@ map<ADDRINT, set<ADDRINT>> interestingFunctionAddrs;
 map<ADDRINT, bool> exitAddrs;
 map<ADDRINT, int> maxObservedSize;
 map<ADDRINT, string> funcNames;
+map<ADDRINT, bool> bbAddrs;
 
 stack<CallStackEntry> callStack;
 
@@ -59,6 +60,8 @@ static VOID addStackUpdateEntry(ADDRINT ip, ADDRINT sp) {
     CallStackEntry &topEntry = callStack.top();
     ADDRINT currentEntry = topEntry.entryAddr;
 
+    // Is this necessary? This is just checking if the instruction that
+    // we end up at is verified by static disass
     auto foundMember = interestingFunctionAddrs[currentEntry].find(ip);
     if (foundMember == interestingFunctionAddrs[currentEntry].end()) {
         return;
@@ -81,16 +84,22 @@ static VOID updateCallStackAtEntry(ADDRINT ip, ADDRINT sp) {
     // cerr << "** " << callStack.size() << " **" << endl;
 }
 
-static VOID updateCallStackAtExit(ADDRINT ip, ADDRINT sp) {
+static VOID updateCallStackAtExit(ADDRINT ip, ADDRINT sp, BOOL isTail) {
     if (callStack.empty()) {
         return;
     }
 
     auto topEntry = callStack.top();
     auto foundExit = boundaryAddrs[topEntry.entryAddr].find(ip);
-    // cerr << std::hex << topEntry.entryAddr << endl;
     if (foundExit == boundaryAddrs[topEntry.entryAddr].end()) {
+        // cerr << "**** START ****" << endl;
         // cerr << "0x" << std::hex << ip << ": 0x" << topEntry.entryAddr << endl;
+        // while (!callStack.empty()) {
+        //     topEntry = callStack.top();
+        //     cerr << "0x" << std::hex << topEntry.entryAddr << endl;
+        //     callStack.pop();
+        // }
+        // cerr << "**** END ****" << endl;
         // exit(0);
         return;
     }
@@ -101,12 +110,12 @@ static VOID updateCallStackAtExit(ADDRINT ip, ADDRINT sp) {
     } else {
         maxObservedSize[topEntry.entryAddr] = topEntry.maxDiff;
     }
-    callStack.pop();
-    // if (topEntry.entryAddr == 0x814077b) {
-    //     cerr << std::hex << ip << endl;
-    // }
 
-    // cerr << "Exit from : " << std::hex << topEntry.entryAddr << endl;
+    if (topEntry.espEntry == sp) {
+        callStack.pop();
+    } else {
+        cerr << std::hex << "0x" << topEntry.entryAddr << ":0x" << ip << endl;
+    }
 }
 
 // Pin calls this function every time a new instruction is encountered
@@ -122,8 +131,6 @@ VOID StackMonitor(INS ins, VOID *v)
 
         IPOINT where = INS_IsValidForIpointAfter(ins) ? IPOINT_AFTER : IPOINT_TAKEN_BRANCH;
 
-        // cerr << std::hex << INS_Address(ins) << endl;
-
         INS_InsertCall(ins, where, (AFUNPTR)addStackUpdateEntry, IARG_REG_VALUE, REG_INST_PTR, IARG_REG_VALUE, REG_STACK_PTR, IARG_END);
     }
 }
@@ -133,6 +140,7 @@ VOID CallMonitor(INS ins, VOID *v) {
 
     auto foundEntry = boundaryAddrs.find(ip);
     if (foundEntry != boundaryAddrs.end()) {
+        // cerr << std::hex << ip << endl;
         INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)updateCallStackAtEntry, IARG_REG_VALUE, REG_INST_PTR, IARG_REG_VALUE, REG_STACK_PTR, IARG_END);
     }
         
@@ -140,14 +148,15 @@ VOID CallMonitor(INS ins, VOID *v) {
     // as soon as they are added
     auto foundExit = exitAddrs.find(ip);
     if (foundExit != exitAddrs.end()) {
-        INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)updateCallStackAtExit, IARG_REG_VALUE, REG_INST_PTR, IARG_REG_VALUE, REG_STACK_PTR, IARG_END);
+        // cerr << std::hex << ip << endl;
+        INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)updateCallStackAtExit, IARG_REG_VALUE, REG_INST_PTR, IARG_REG_VALUE, REG_STACK_PTR, IARG_BOOL, foundExit->second, IARG_END);
     }
 }
 
 VOID ParseAddrs() {
     string line, name;
-    ADDRINT entryAddr, exitAddr, memberAddr;
-    ADDRINT flag;
+    ADDRINT entryAddr, exitAddr, memberAddr, bbAddr;
+    ADDRINT flag, exitType;
 
     std::ifstream infile(KnobInputFile.Value().c_str());
     while (std::getline(infile, line)) {
@@ -159,17 +168,25 @@ VOID ParseAddrs() {
             // cerr << "Entry: " << std::hex << entryAddr << endl;
             boundaryAddrs[entryAddr] = set<ADDRINT>();
             interestingFunctionAddrs[entryAddr] = set<ADDRINT>();
-        } else if (flag == 1) {
-            temp >> exitAddr;
-            // cerr << "Exit: " << std::hex << exitAddr << endl;
-            boundaryAddrs[entryAddr].insert(exitAddr);
-            exitAddrs[exitAddr] = true;
         } else if (flag == 2) {
+            temp >> exitAddr;
+            temp >> exitType;
+            boundaryAddrs[entryAddr].insert(exitAddr);
+            // True if it is a tailcall or jmp based call out of a function
+            if (exitType == 0) {
+                exitAddrs[exitAddr] = false;
+            } else {
+                exitAddrs[exitAddr] = true;
+            }
+        } else if (flag == 1) {
             temp >> memberAddr;
             interestingFunctionAddrs[entryAddr].insert(memberAddr);
         } else if (flag == 3) {
             temp >> name;
             funcNames[entryAddr] = name;
+        } else if (flag == 4) {
+            temp >> bbAddr;
+            bbAddrs[bbAddr] = true;
         }
     }
 
