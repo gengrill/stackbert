@@ -1,12 +1,12 @@
 Results
 -------
 
-Data is organized as:
+Model predicted data is organized as:
 
 ```
 {
   "name of binary": {
-                      "func_name": [actualValue, predictedValue, verdict]
+                      "func_name": [staticCollectedValue, predictedValue, verdict]
                     }
                     ,
 }
