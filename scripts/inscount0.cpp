@@ -27,21 +27,28 @@ using std::map;
 using std::set;
 using std::istringstream;
 using std::stack;
+using std::pair;
 
 ofstream OutFile;
 
-typedef struct {
+struct CallStackEntry {
     ADDRINT entryAddr;
     ADDRINT espEntry;
+    ADDRINT callSiteAddr;
     int maxDiff;
-} CallStackEntry;
+    string parent;
+    string fnName;
 
-map<ADDRINT, set<ADDRINT>> boundaryAddrs;
-map<ADDRINT, set<ADDRINT>> interestingFunctionAddrs;
-map<ADDRINT, bool> exitAddrs;
-map<ADDRINT, int> maxObservedSize;
-map<ADDRINT, string> funcNames;
-map<ADDRINT, bool> bbAddrs;
+    CallStackEntry (ADDRINT entryAddr, ADDRINT espEntry, ADDRINT callSiteAddr) : 
+        entryAddr(entryAddr), espEntry(espEntry), callSiteAddr(callSiteAddr) {
+            parent = RTN_FindNameByAddress(callSiteAddr);
+            fnName = RTN_FindNameByAddress(entryAddr);
+            maxDiff = 0;
+        }
+};
+
+map<ADDRINT, pair<int, string>> maxObservedSize;
+map<string, bool> interestingFuncs;
 
 stack<CallStackEntry> callStack;
 
@@ -51,20 +58,37 @@ KNOB<string> KnobOutputFile(KNOB_MODE_WRITEONCE, "pintool",
 KNOB<string> KnobInputFile(KNOB_MODE_WRITEONCE, "pintool",
     "i", "addrs.txt", "specify input file name");
 
+BOOL IsIpInteresting(ADDRINT ip) {
+    string funcName = RTN_FindNameByAddress(ip);
+    auto isInteresting = interestingFuncs.find(funcName);
+    if (isInteresting != interestingFuncs.end()) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
 // This function is called before every instruction is executed
 static VOID addStackUpdateEntry(ADDRINT ip, ADDRINT sp) { 
     if (callStack.empty()) {
         return;
     }
 
+    string containingFn = RTN_FindNameByAddress(ip);
     CallStackEntry &topEntry = callStack.top();
-    ADDRINT currentEntry = topEntry.entryAddr;
 
-    // Is this necessary? This is just checking if the instruction that
-    // we end up at is verified by static disass
-    auto foundMember = interestingFunctionAddrs[currentEntry].find(ip);
-    if (foundMember == interestingFunctionAddrs[currentEntry].end()) {
-        return;
+    if (topEntry.fnName != containingFn) {
+        cerr << "**********************************" << endl;
+        cerr << "        Error in execution        " << endl;
+        cerr << "Containing Function: " << containingFn << endl;
+        cerr << "Current top frame:   " << callStack.top().fnName << endl;
+        cerr << "CallStack: " << endl;
+        while (!callStack.empty()) {
+            cerr << callStack.top().fnName << endl;
+            callStack.pop();
+        }
+        cerr << "**********************************" << endl;
+        PIN_ExitApplication(1);
     }
 
     int currentDiff = topEntry.espEntry - sp;
@@ -72,127 +96,156 @@ static VOID addStackUpdateEntry(ADDRINT ip, ADDRINT sp) {
     // cerr << std::hex << ip << ":" << std::dec << topEntry.maxDiff << endl;
 }
 
-static VOID updateCallStackAtEntry(ADDRINT ip, ADDRINT sp) {
-    CallStackEntry entry;
-    entry.entryAddr = ip;
-    entry.espEntry = sp;
-    entry.maxDiff = 0;
+static VOID updateCallStackAtEntry(ADDRINT target, ADDRINT source, ADDRINT sp) {
+    string targetFn = RTN_FindNameByAddress(target);
+    string sourceFn = RTN_FindNameByAddress(source);
 
+    if (targetFn.find("@plt") != string::npos ||
+        !IsIpInteresting(target)) {
+        return;
+    }
+
+    CallStackEntry entry(target, sp, source);
     callStack.push(entry);
-    // cerr << "Entry into : " << std::hex << ip << endl;
-    // cerr << std::hex << ip << endl;
-    // cerr << "** " << callStack.size() << " **" << endl;
 }
 
-static VOID updateCallStackAtExit(ADDRINT ip, ADDRINT sp, BOOL isTail) {
+static VOID updateCallStackAtExit(ADDRINT target, ADDRINT source, ADDRINT sp) {
+    string targetFn = RTN_FindNameByAddress(target);
+    string sourceFn = RTN_FindNameByAddress(source);
+    // cerr << "Exit from " << sourceFn << " to " << targetFn << endl;
+    
     if (callStack.empty()) {
         return;
     }
 
-    auto topEntry = callStack.top();
-    auto foundExit = boundaryAddrs[topEntry.entryAddr].find(ip);
-    if (foundExit == boundaryAddrs[topEntry.entryAddr].end()) {
-        // cerr << "**** START ****" << endl;
-        // cerr << "0x" << std::hex << ip << ": 0x" << topEntry.entryAddr << endl;
-        // while (!callStack.empty()) {
-        //     topEntry = callStack.top();
-        //     cerr << "0x" << std::hex << topEntry.entryAddr << endl;
-        //     callStack.pop();
-        // }
-        // cerr << "**** END ****" << endl;
-        // exit(0);
-        return;
+    ADDRINT entryAddr = callStack.top().entryAddr;
+    auto diffSearch = maxObservedSize.find(entryAddr);
+    if (diffSearch == maxObservedSize.end()) {
+        maxObservedSize[entryAddr] = {0, callStack.top().fnName};
     }
 
-    auto foundSize = maxObservedSize.find(topEntry.entryAddr);
-    if (foundSize != maxObservedSize.end()) {
-        maxObservedSize[topEntry.entryAddr] = std::max(foundSize->second, topEntry.maxDiff);
-    } else {
-        maxObservedSize[topEntry.entryAddr] = topEntry.maxDiff;
-    }
-
-    if (topEntry.espEntry == sp) {
-        callStack.pop();
-    } else {
-        cerr << std::hex << "0x" << topEntry.entryAddr << ":0x" << ip << endl;
-    }
+    maxObservedSize[entryAddr].first = std::max(maxObservedSize[entryAddr].first, callStack.top().maxDiff);
+    callStack.pop();
 }
 
-// Pin calls this function every time a new instruction is encountered
-VOID StackMonitor(INS ins, VOID *v)
-{
+
+VOID StackMonitor(INS ins, VOID *v) {
     if (INS_RegWContain(ins, REG_STACK_PTR) ||
         INS_Category(ins) == XED_CATEGORY_CALL ||
         INS_Category(ins) == XED_CATEGORY_PUSH ||
         INS_Category(ins) == XED_CATEGORY_POP ||
         INS_Category(ins) == XED_CATEGORY_RET) {
 
-        if (INS_IsSysenter(ins)) return;
+        if (INS_IsSysenter(ins)) {
+            return;
+        }
+
+        ADDRINT ip = INS_Address(ins);
+        if (!IsIpInteresting(ip)) {
+            return;
+        }
 
         IPOINT where = INS_IsValidForIpointAfter(ins) ? IPOINT_AFTER : IPOINT_TAKEN_BRANCH;
 
-        INS_InsertCall(ins, where, (AFUNPTR)addStackUpdateEntry, IARG_REG_VALUE, REG_INST_PTR, IARG_REG_VALUE, REG_STACK_PTR, IARG_END);
+        INS_InsertCall(ins, where, 
+                (AFUNPTR)addStackUpdateEntry, 
+                IARG_REG_VALUE, REG_INST_PTR, 
+                IARG_REG_VALUE, REG_STACK_PTR, 
+                IARG_END);
+    }
+}
+
+VOID handleInterFunctionJump(ADDRINT target, ADDRINT source, ADDRINT sp) {
+    string targetFn = RTN_FindNameByAddress(target);
+    string sourceFn = RTN_FindNameByAddress(source);
+
+    if (callStack.empty()) {
+        return;
+    }
+
+    callStack.pop();
+    if (targetFn.find("@plt") != string::npos ||
+        !IsIpInteresting(target)) {
+        return;
+    }
+
+    CallStackEntry entry(target, sp, source);
+    callStack.push(entry);
+}
+
+VOID handleIndirectFlow(ADDRINT target, ADDRINT source, ADDRINT sp, BOOL isCall) {
+    string targetFn = RTN_FindNameByAddress(target);
+    string sourceFn = RTN_FindNameByAddress(source);
+
+    if (!isCall) {
+        if (targetFn != sourceFn) {
+            callStack.pop();
+
+            if (targetFn.find("@plt") != string::npos ||
+                !IsIpInteresting(target)) {
+                return;
+            }
+        
+            CallStackEntry entry(target, source, sp);
+            callStack.push(entry);
+        }
+    } else {
+        if (targetFn.find("@plt") != string::npos ||
+            !IsIpInteresting(target)) {
+            return;
+        }
+
+        CallStackEntry entry(target, sp, source);
+        callStack.push(entry);
     }
 }
 
 VOID CallMonitor(INS ins, VOID *v) {
     ADDRINT ip = INS_Address(ins);
-
-    auto foundEntry = boundaryAddrs.find(ip);
-    if (foundEntry != boundaryAddrs.end()) {
-        // cerr << std::hex << ip << endl;
-        INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)updateCallStackAtEntry, IARG_REG_VALUE, REG_INST_PTR, IARG_REG_VALUE, REG_STACK_PTR, IARG_END);
+    if (!INS_IsControlFlow(ins)) {
+        return;
     }
-        
-    // For some functions which have a single instruction, we need to ensure that we remove them off the callstack
-    // as soon as they are added
-    auto foundExit = exitAddrs.find(ip);
-    if (foundExit != exitAddrs.end()) {
-        // cerr << std::hex << ip << endl;
-        INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)updateCallStackAtExit, IARG_REG_VALUE, REG_INST_PTR, IARG_REG_VALUE, REG_STACK_PTR, IARG_BOOL, foundExit->second, IARG_END);
+
+    if (!IsIpInteresting(ip)) {
+        return;
     }
-}
 
-VOID ParseAddrs() {
-    string line, name;
-    ADDRINT entryAddr, exitAddr, memberAddr, bbAddr;
-    ADDRINT flag, exitType;
+    if (INS_IsRet(ins)) {
+        INS_InsertCall(ins, IPOINT_TAKEN_BRANCH,
+                (AFUNPTR)updateCallStackAtExit,
+                IARG_BRANCH_TARGET_ADDR,
+                IARG_ADDRINT, ip,
+                IARG_REG_VALUE, REG_STACK_PTR,
+                IARG_END);
+    } else if (INS_IsDirectControlFlow(ins)) {
+        ADDRINT target = INS_DirectControlFlowTargetAddress(ins);
 
-    std::ifstream infile(KnobInputFile.Value().c_str());
-    while (std::getline(infile, line)) {
-        istringstream temp(line, istringstream::in);
-        temp >> flag;
-        
-        if (flag == 0) {
-            temp >> entryAddr;
-            // cerr << "Entry: " << std::hex << entryAddr << endl;
-            boundaryAddrs[entryAddr] = set<ADDRINT>();
-            interestingFunctionAddrs[entryAddr] = set<ADDRINT>();
-        } else if (flag == 2) {
-            temp >> exitAddr;
-            temp >> exitType;
-            boundaryAddrs[entryAddr].insert(exitAddr);
-            // True if it is a tailcall or jmp based call out of a function
-            if (exitType == 0) {
-                exitAddrs[exitAddr] = false;
-            } else {
-                exitAddrs[exitAddr] = true;
+        if (INS_IsCall(ins)) {
+            INS_InsertCall(ins, IPOINT_TAKEN_BRANCH,
+                    (AFUNPTR)updateCallStackAtEntry,
+                    IARG_ADDRINT, target,
+                    IARG_ADDRINT, ip,
+                    IARG_REG_VALUE, REG_STACK_PTR,
+                    IARG_END);
+        } else {
+            if (RTN_FindNameByAddress(target) != RTN_FindNameByAddress(ip)) {
+                INS_InsertCall(ins, IPOINT_TAKEN_BRANCH,
+                    (AFUNPTR)handleInterFunctionJump,
+                    IARG_ADDRINT, target,
+                    IARG_ADDRINT, ip,
+                    IARG_REG_VALUE, REG_STACK_PTR,
+                    IARG_END);
             }
-        } else if (flag == 1) {
-            temp >> memberAddr;
-            interestingFunctionAddrs[entryAddr].insert(memberAddr);
-        } else if (flag == 3) {
-            temp >> name;
-            funcNames[entryAddr] = name;
-        } else if (flag == 4) {
-            temp >> bbAddr;
-            bbAddrs[bbAddr] = true;
         }
+    } else if (INS_IsIndirectControlFlow(ins)) {
+        INS_InsertCall(ins, IPOINT_TAKEN_BRANCH,
+                (AFUNPTR)handleIndirectFlow,
+                IARG_BRANCH_TARGET_ADDR,
+                IARG_ADDRINT, ip,
+                IARG_REG_VALUE, REG_STACK_PTR,
+                IARG_BOOL, INS_IsCall(ins),
+                IARG_END);
     }
-
-    cerr << "======================" << endl;
-    cerr << "Parsing of addrs done!" << endl;
-    cerr << "======================" << endl;
 }
 
 // This function is called when the application exits
@@ -200,9 +253,13 @@ VOID Fini(INT32 code, VOID *v)
 {
     ofstream result;
     result.open(KnobOutputFile.Value().c_str());
-    for (auto& addrPair : maxObservedSize) {
-        result << funcNames[addrPair.first] << ":" << addrPair.second << endl;
+    result << "{";
+    for (auto& sizePair : maxObservedSize) {
+        result << "\"" << sizePair.second.second << "\":";
+        result << sizePair.second.first << ",";
     }
+    result.seekp(-1, std::ios_base::end);
+    result << "}";
     result.close();
 
     cerr << "======================" << endl;
@@ -221,6 +278,20 @@ INT32 Usage()
     return -1;
 }
 
+VOID Image(IMG img, VOID *v) {
+    if (IMG_IsMainExecutable(img)) {
+        for (SEC sec = IMG_SecHead(img); SEC_Valid(sec); sec = SEC_Next(sec)) {
+            if (SEC_Name(sec) != ".text") {
+                continue;
+            }
+
+            for (RTN rtn = SEC_RtnHead(sec); RTN_Valid(rtn); rtn = RTN_Next(rtn)) {
+                interestingFuncs[RTN_Name(rtn)] = true;
+            }
+        }
+    }
+}
+
 /* ===================================================================== */
 /* Main                                                                  */
 /* ===================================================================== */
@@ -232,13 +303,17 @@ int main(int argc, char * argv[])
     // Initialize pin
     if (PIN_Init(argc, argv)) return Usage();
 
+    PIN_InitSymbols();
+
+    IMG_AddInstrumentFunction(Image, 0);
+
     // Register StackMonitor to be called when checking stack updates
     INS_AddInstrumentFunction(StackMonitor, 0);
 
     // Register CallMonitor to be called at function starts and ends
     INS_AddInstrumentFunction(CallMonitor, 0);
 
-    ParseAddrs();
+    // ParseAddrs();
 
     // Register Fini to be called when the application exits
     PIN_AddFiniFunction(Fini, 0);
