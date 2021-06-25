@@ -82,7 +82,7 @@ class Function(dwarf_import.model.elements.Function):
 logging.basicConfig(
 #    filename='stacksyms_run.log',
     format='{asctime} {levelname}:{funcName}:{message}',
-    style="{", datefmt='%m/%d/%Y %H:%M:%S', level=logging.INFO,
+    style="{", datefmt='%m/%d/%Y %H:%M:%S', level=logging.CRITICAL,
 )
 
 # Vector35's dwarf_import library has:
@@ -392,8 +392,9 @@ def resolveType(_type):
 # where source code and target compiler are both available. These constraints are quite limiting.
 # The second option works reasonably well in practice, but requires accurate disassembly and modeling
 # of stack operations for each architecture (TODO: are there other downsides???).
-# The third option may provide an actual number most of the time, but some compilers seem to generate
-# code that keeps the base pointer in a register
+# The third option may provide an actual number most of the time, but compilers may decide to keep the
+# base pointer in a register and never write it to the stack (in which case cfa offset is REGISTER+0).
+# The fourth option requires reliable and complete type information, which is usually not available.
 def getMaxFrameSize(function):
     '''Get maximum frame size of a function based on its .eh_frame entry.
        The number we obtain here statically can actually be validated at runtime (e.g, using GDB):
@@ -436,11 +437,13 @@ def getMaxOff(stkElms): # maximal stack offset across all elements
 
 def generateDebugLabel(func):
     funElms  = len(func.parameters) + len(func.variables) + len(func.registers)
-    stkSlots = sorted(getStackElements(func), key=getMaxStackOff)
+    inlinedStackElms = [getStackElements(inlined) for inlined in func.inlined_functions]
+    stkSlots = sorted(getStackElements(func) + inlinedStackElms, key=getMaxStackOff)
     if len(stkSlots) != funElms:
         logging.info(f"Function {func.name} has {len(stkSlots)} stack elements out of {funElms} total.")
     logging.debug(f"{func.name} => [{', '.join(stkElm.name+'@ebp%+d'%getMaxStackOff(stkElm) for stkElm in stkSlots)}]")
-    return [stkElm.type.byte_size for stkElm in stkSlots] #  if stkElm.type not in [Type._VOID, Type._VARIADIC]]
+    retaddr = getRegisterSize(func.arch)
+    return [retaddr] + [stkElm.type.byte_size for stkElm in stkSlots] #  if stkElm.type not in [Type._VOID, Type._VARIADIC]]
 
 # FIXME for some reason Location.pc may be 0 for some local variables, even if line['pc'] is nonzero
 def getStackElements(function):
@@ -469,8 +472,11 @@ def checkLabels(functions):
     logging.info(f"Start collecting labels for {len(functions)} functions..")
     allLabels = {}
     for func in functions:
+        if func.is_inline:
+            continue
         frame = getMaxFrameSize(func)
         label = generateDebugLabel(func)
+        maxCfa = getMaxFrameSizeCFA(func)
         if any(True for slotSize in label if slotSize is None):
             logging.warn(f"Function {func.name} has VOID or VARIADIC type stack objects; cannot determine frame size reliably!")
             continue
@@ -482,6 +488,7 @@ def checkLabels(functions):
         allLabels[func.name]['inp'] = ' '.join([func.code[i:i+2] for i in range(0, len(func.code), 2)])
         allLabels[func.name]['max'] = frame
         allLabels[func.name]['out'] = label
+        allLabels[func.name]['maxCFA'] = maxCfa
     return allLabels
 
 def collectOpcodes(func_dict, elf):
@@ -505,7 +512,7 @@ def collectOpcodes(func_dict, elf):
             if section_start <= func.start <= section_end:
                 section = code_sections[(section_start, section_end)]
                 if func.start%section['sh_addralign'] != 0:
-                    logging.warn(f"Function {func.name}@{hex(func.start)} does not adhere to section alignment.")
+                    logging.debug(f"Function {func.name}@{hex(func.start)} does not adhere to section alignment.")
                 start_off = func.start - section_start
                 end_off   = func.start + func.size - section_start
                 func._code = section.data()[start_off:end_off+1]
