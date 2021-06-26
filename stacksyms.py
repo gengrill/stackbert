@@ -364,23 +364,25 @@ def propagateTypeInfo(func_dict, importer):
     for _type in types:
         if not _type.is_qualified_type or _type.byte_size is None:
             if _type.array_count is not None:
-                arrayType = resolveType(_type)
-                if not arrayType.is_base:
-                    logging.warn(f"Can't resolve array type {_type}!")
-                    continue
-                # FIXME there was a bug with pointer arrays here.. seems to work for now??
+                # TODO there was a bug with pointer arrays here.. seems to work for now??
                 if _type.element._scalar_type==ScalarType.POINTER_TYPE: # regular ptrs
                     if _type.byte_size is None:
                         _type._byte_size = _type.array_count * getRegisterSize(arch)
                         continue
                 if resolveType(_type, True)._scalar_type == ScalarType.POINTER_TYPE: # code ptrs
-                    if arrayType.byte_size is None:
+                    if _type.byte_size is None:
                         _type._byte_size = _type.array_count * getRegisterSize(arch)
                         continue
-                    logging.critical(f"Cannot resolve array type {arrayType} for type {_type}")
-                _type._byte_size = _type.array_count * arrayType.byte_size # TODO check this
+                if _type.byte_size is None:
+                    arrayType = resolveType(_type)
+                    if arrayType.byte_size is not None:
+                        _type._byte_size = _type.array_count * arrayType.byte_size # TODO check this
+                        continue
+                logging.critical(f"Cannot resolve array type {_type}")
             elif _type.composite_type is not None:
-                logging.warn(f"Can't yet handle composite type {_type}!")
+                if _type.byte_size is None:
+                    print(_type.composite_type)
+                    logging.critical(f"Can't yet handle composite type {_type}!") # FIXME implement this
             elif _type.element is not None: # this is the frequent case
                 base = resolveType(_type)
                 if base.byte_size is None:
