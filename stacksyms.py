@@ -12,13 +12,19 @@ from elftools.elf.elffile import ELFFile
 from elftools.dwarf.descriptions import ExprDumper, describe_reg_name, describe_CFI_register_rule, describe_CFI_CFA_rule
 
 from dwarf_import.model.module import Module
-from dwarf_import.model.elements import Component, Parameter, LocalVariable, Location, Type, LocationType, ExprOp
+from dwarf_import.model.elements import Component, Parameter, LocalVariable, Location, Type, ScalarType, CompositeType, LocationType, ExprOp
 
 from dwarf_import.io.dwarf_expr import ExprEval, LocExprParser
 from dwarf_import.io.dwarf_import import DWARFDB, DWARFImporter
 from dwarf_import.io.dwarf_import import place_component_in_module_tree
 
 from typing import Optional
+
+logging.basicConfig(
+#    filename='stacksyms_run.log',
+    format='{asctime} {levelname}:{funcName}:{message}',
+    style="{", datefmt='%m/%d/%Y %H:%M:%S', level=logging.CRITICAL,
+)
 
 class Register(dwarf_import.model.elements.Element):
     type = Type(name='Register')
@@ -78,12 +84,6 @@ class Function(dwarf_import.model.elements.Function):
         if self._code is not None:
             return self._code.hex()
         return ''
-
-logging.basicConfig(
-#    filename='stacksyms_run.log',
-    format='{asctime} {levelname}:{funcName}:{message}',
-    style="{", datefmt='%m/%d/%Y %H:%M:%S', level=logging.CRITICAL,
-)
 
 # Vector35's dwarf_import library has:
 #   (1) the io classes which deal with ELF/DWARF stuff,
@@ -347,7 +347,9 @@ def getRegisterSize(arch):
 #      so we don't provide any size information for them at the moment.
 def propagateTypeInfo(func_dict, importer):
     types = set() #for Type in importer._type_factory.iter_types():
+    arch = None
     for function in func_dict.values():
+        arch = function.arch
         for parameter in function.parameters:
             if parameter.type is None:
                 logging.warn(f"Parameter {parameter} has 'None' Type association!")
@@ -366,7 +368,12 @@ def propagateTypeInfo(func_dict, importer):
                 if not arrayType.is_base:
                     logging.warn(f"Can't resolve array type {_type}!")
                     continue
-                _type._byte_size = _type.array_count * arrayType.byte_size # TODO check correctness
+                # FIXME there was a bug with pointer arrays here.. seems to work now?
+                if _type.element._scalar_type==ScalarType.POINTER_TYPE:
+                    if _type.byte_size is None:
+                        _type._byte_size = _type.array_count * getRegisterSize(arch)
+                        continue
+                _type._byte_size = _type.array_count * arrayType.byte_size # TODO check this
             elif _type.composite_type is not None:
                 logging.warn(f"Can't yet handle composite type {_type}!")
             elif _type.element is not None: # this is the frequent case
@@ -374,7 +381,7 @@ def propagateTypeInfo(func_dict, importer):
                 if base.byte_size is None:
                     logging.warn(f"Type propagation for type {base} yields size 'None'!")
                     continue
-                _type._byte_size = base._byte_size # TODO check correctness
+                _type._byte_size = base._byte_size # TODO check this
     return func_dict
 
 def resolveType(_type):
