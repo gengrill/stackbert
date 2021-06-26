@@ -368,11 +368,16 @@ def propagateTypeInfo(func_dict, importer):
                 if not arrayType.is_base:
                     logging.warn(f"Can't resolve array type {_type}!")
                     continue
-                # FIXME there was a bug with pointer arrays here.. seems to work now?
-                if _type.element._scalar_type==ScalarType.POINTER_TYPE:
+                # FIXME there was a bug with pointer arrays here.. seems to work for now??
+                if _type.element._scalar_type==ScalarType.POINTER_TYPE: # regular ptrs
                     if _type.byte_size is None:
                         _type._byte_size = _type.array_count * getRegisterSize(arch)
                         continue
+                if resolveType(_type, True)._scalar_type == ScalarType.POINTER_TYPE: # code ptrs
+                    if arrayType.byte_size is None:
+                        _type._byte_size = _type.array_count * getRegisterSize(arch)
+                        continue
+                    logging.critical(f"Cannot resolve array type {arrayType} for type {_type}")
                 _type._byte_size = _type.array_count * arrayType.byte_size # TODO check this
             elif _type.composite_type is not None:
                 logging.warn(f"Can't yet handle composite type {_type}!")
@@ -384,7 +389,14 @@ def propagateTypeInfo(func_dict, importer):
                 _type._byte_size = base._byte_size # TODO check this
     return func_dict
 
-def resolveType(_type):
+def resolveType(_type, secondToLast=False):
+    if secondToLast: # this is mainly to find function pointer arrays (e.g., 'void()*[100]')
+        if _type.element is not None and _type.element.element is not None:
+            if _type.element.element.element is None:
+                if _type.element._composite_type == CompositeType.FUNCTION_TYPE:
+                    return _type
+                return _type.element
+            return resolveType(_type.element, secondToLast)
     return _type if _type.element is None else resolveType(_type.element)
 
 # There are different ways we could try to get a number for the stack frame size of a binary
