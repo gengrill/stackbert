@@ -5,10 +5,14 @@
 # certainly helps in generating better ground truth information.
 import os
 import logging
+
+# force local import of pyelftools
+import sys; sys.path.insert(0, 'pyelftools')
 import elftools
-import dwarf_import
+import elftools.dwarf, elftools.elf
 
 from elftools.elf.elffile import ELFFile
+
 from elftools.dwarf.descriptions import ExprDumper, describe_reg_name, describe_CFI_register_rule, describe_CFI_CFA_rule
 
 from dwarf_import.model.module import Module
@@ -17,6 +21,8 @@ from dwarf_import.model.elements import Component, Parameter, LocalVariable, Loc
 from dwarf_import.io.dwarf_expr import ExprEval, LocExprParser
 from dwarf_import.io.dwarf_import import DWARFDB, DWARFImporter
 from dwarf_import.io.dwarf_import import place_component_in_module_tree
+
+import dwarf_import # vector35's dwarf library (helps with types)
 
 from typing import Optional
 
@@ -373,7 +379,7 @@ def propagateTypeInfo(func_dict, importer):
                     if _type.byte_size is None:
                         _type._byte_size = _type.array_count * getRegisterSize(arch)
                         continue
-                if _type.byte_size is None:
+                if _type.byte_size is None: # non-pointer arrays
                     arrayType = resolveType(_type)
                     if arrayType.byte_size is not None:
                         _type._byte_size = _type.array_count * arrayType.byte_size # TODO check this
@@ -381,8 +387,7 @@ def propagateTypeInfo(func_dict, importer):
                 logging.critical(f"Cannot resolve array type {_type}")
             elif _type.composite_type is not None:
                 if _type.byte_size is None:
-                    print(_type.composite_type)
-                    logging.critical(f"Can't yet handle composite type {_type}!") # FIXME implement this
+                    logging.critical(f"Can't yet handle type {_type} with composite {_type.composite_type}!") # FIXME implement this
             elif _type.element is not None: # this is the frequent case
                 base = resolveType(_type)
                 if base.byte_size is None:
@@ -392,7 +397,7 @@ def propagateTypeInfo(func_dict, importer):
     return func_dict
 
 def resolveType(_type, secondToLast=False):
-    if secondToLast: # this is mainly to find function pointer arrays (e.g., 'void()*[100]')
+    if secondToLast: # this case is mainly to find function pointer arrays (e.g., 'void()*[100]')
         if _type.element is not None and _type.element.element is not None:
             if _type.element.element.element is None:
                 if _type.element._composite_type == CompositeType.FUNCTION_TYPE:
