@@ -56,6 +56,7 @@ logging.basicConfig(
 )
 
 class Register(dwarf_import.model.elements.Element):
+    '''Dataclass for spilled registers'''
     type = Type(name='Register')
     def __init__(self, number, name, locations):
         super().__init__(owner=None, name=name)
@@ -66,6 +67,7 @@ class Register(dwarf_import.model.elements.Element):
                         + f'locations={self.locations}>'
 
 class Function(dwarf_import.model.elements.Function):
+    '''Dataclass for parsed symbol definitions (including opcodes).'''
     @classmethod
     def fromDWARFFunction(cls, old: dwarf_import.model.elements.Function):
         new = cls(owner=old.owner, name=old.name, start=old.start)
@@ -116,6 +118,7 @@ class Function(dwarf_import.model.elements.Function):
             return self._code.hex()
         return ''
 
+# This is the entry point (use together with 'predictStackFrameLayout').
 def parseELF(filepath):
     '''Returns a list of functions (if the file contains frame info section)'''
     logging.info(f"Trying to parse {filepath} as ELF")
@@ -135,6 +138,38 @@ def parseELF(filepath):
     processInlineFunctions(func_dict, importer, elf)
     return func_dict.values()
 
+# This is the main interface for obtaining predictions (pass result of 'parseELF').
+def predictStackframeLayouts(functions, want_analysis=False):
+    '''Returns a list of function frame layout predictions. Requires capstone
+       installation if want_analysis=True (generally improves results).'''
+    logging.info(f"Collecting predictions for {len(functions)} functions.")
+    allLabels = {}
+    for func in functions:
+        if not func.is_inline:
+            funclabel = dict()
+            funclabel['inp'] = ' '.join([
+                func.code[i:i+2] for i in range(0, len(func.code), 2)
+            ])
+            funclabel['max'] = getMaxFrameSize(func)
+            funclabel['out'] = generateDebugLabel(func)
+            funclabel['maxCFA'] = getMaxFrameSizeCFA(func)
+            if want_analysis: # requires capstone
+                stackops, maxstack  = disassembleAndAnalyzeSymbolically(func)
+                funclabel['maxANA'] = maxstack
+                funclabel['outANA'] = stackops
+                logging.info(f"{func.name} ({funclabel['max']}" \
+                            +f"/ {sum(funclabel['out'])} " \
+                            +f"/ {funclabel['maxCFA']} " \
+                            +f"/ {funclabel['maxANA']}) " \
+                            +f"=> {funclabel['out']} / {funclabel['outANA']}")
+            else:
+                logging.info(f"{func.name} ({funclabel['max']}" \
+                            +f"/ {sum(funclabel['out'])} " \
+                            +f"/ {funclabel['maxCFA']} " \
+                            +f"=> {funclabel['out']}")
+            allLabels[func.name] = funclabel
+    return allLabels
+
 # TODO: if frame table is indeed missing, try generating it
 # e.g., using https://github.com/frdwarf/dwarf-synthesis
 def parseDWARF(elf):
@@ -143,14 +178,14 @@ def parseDWARF(elf):
         logging.info("ELF file says it has some frame info..")
         module = Module()
         dwarfDB = DWARFDB(elf) # io data class for parsing
-        # passing {'only_concrete_subprograms' : False}) yields start=0 symbols
+        # passing {'only_concrete_subprograms' : False} yields start=0 symbols
         importer = DWARFImporter(dwarfDB, dict())
         for component in importer.import_components():
             place_component_in_module_tree(module, component)
         return module, importer # importer has state after parsing
     raise RuntimeError("ELF file does not contain required information!")
 
-# TODO: relies on .symtab or .dynsym -> support externel symbol discovery
+# TODO: relies on .symtab or .dynsym -> support external symbol discovery
 def getAllFunctions(module, importer, elf):
     '''Returns dwarf_import.model.elements.Function objects.'''
     # from the .symtab section (name, address, and size only)
@@ -187,6 +222,7 @@ def processInlineFunctions(func_dict, importer, elf):
     inlinedFs = assign_frames(inlined_frame_tables, inlinedFs)
     inlinedFs = processRegisterRuleExpressions(inlinedFs, importer)
     inlinedFs = propagateTypeInfo(inlinedFs, importer)
+    return
 
 # TODO: for some reason, there may be duplicates?
 def getInlined(functions):
@@ -354,6 +390,7 @@ def processCFARule(line, func, importer):
         func._registers['cfa'].locations.update({cfa_loc})
     else:
         logging.critical(f"{describe_CFI_CFA_rule(line['cfa'])}@{func.name}.")
+    return
 
 def processRegisterRule(regNo, line, func, importer):
     pc = line['pc'] # start address for rules in this line
@@ -372,6 +409,7 @@ def processRegisterRule(regNo, line, func, importer):
         regname = describe_reg_name(regNo, func.arch)
         func._registers[regNo] = Register(regNo, regname, set())
     func._registers[regNo].locations.update({loc})
+    return
 
 def getRegisterSize(arch):
     return {
@@ -400,7 +438,7 @@ def propagateTypeInfo(func_dict, importer):
                 continue
             types |= {variable.type}
     logging.debug(f"Type list for functions: {types}.")
-    for _type in types:
+    for _type in types: # we want to process most types (even with byte size)
         if not _type.is_qualified_type or _type.byte_size is None:
             if _type.array_count is not None: # arrays
                 if _type.element._scalar_type==ScalarType.POINTER_TYPE:
@@ -459,7 +497,6 @@ def getMaxFrameSizeCFA(function):
             cfaLocExprs += [loc.expr[1]]
     return max(cfaLocExprs)
 
-# FIXME Location.pc may be 0 for some local variables, even if line['pc'] != 0
 def getStackElements(function):
     '''return stack elements (in no particular order)'''
     candidates = function.parameters + function.variables + function.registers
@@ -470,7 +507,6 @@ def getStackLocations(stkElm):
     return [loc for loc in stkElm.locations if locExprHasOffset(loc)]
 
 def locExprHasOffset(location): # TODO y0 d4wg, this sh!t is sketchy as f*&^
-    # FIXME with LocationType.DYNAMIC we get 'None' sized objects on the stack
     if location.type in [LocationType.STATIC_GLOBAL, LocationType.STATIC_LOCAL, LocationType.DYNAMIC]:
         return len(location.expr) > 1 and type(location.expr[1]) == int
     return False
@@ -504,26 +540,6 @@ def collectOpcodes(func_dict, elf):
         if func.code is None:
             logging.critical(f"Symbol {func.name}@{hex(func.start)} undefined, opcodes missing!")
     return func_dict
-
-def checkLabels(functions, want_analysis=False):
-    logging.info(f"Start collecting labels for {len(functions)} functions..")
-    allLabels = {}
-    for func in functions:
-        if not func.is_inline:
-            funclabel = dict()
-            funclabel['inp'] = ' '.join([func.code[i:i+2] for i in range(0, len(func.code), 2)])
-            funclabel['max'] = getMaxFrameSize(func)
-            funclabel['out'] = generateDebugLabel(func)
-            funclabel['maxCFA'] = getMaxFrameSizeCFA(func)
-            if want_analysis: # requires capstone
-                stackops, maxstack = disassembleAndAnalyzeSymbolically(func)
-                funclabel['maxANA'] = maxstack
-                funclabel['outANA'] = stackops
-                logging.info(f"{func.name} ({funclabel['max']} / {sum(funclabel['out'])} / {funclabel['maxCFA']} / {funclabel['maxANA']}) => {funclabel['out']} / {funclabel['outANA']}")
-            else:
-                logging.info(f"{func.name} ({funclabel['max']} / {sum(funclabel['out'])} / {funclabel['maxCFA']}) => {funclabel['out']}")
-            allLabels[func.name] = funclabel
-    return allLabels
 
 def generateDebugLabel(func):
     funElms  = len(func.parameters) + len(func.variables) + len(func.registers)
@@ -578,8 +594,6 @@ def disasAndAnalyzeStackAMD64(func, m32=False):
                     stackops += [-int(i.op_str.split(' ')[1], 16)]
                 elif i.mnemonic == 'mov':
                     pass # FIXME I guess we can't do much here?
-                elif i.mnemonic in ['lea', 'cmp']:
-                    pass
                 else:
                     raise RuntimeError(f"0x{hex(i.address)}:\t{i.mnemonic}\t{i.op_str}")
         _sum  = sum(stackops)
