@@ -1,10 +1,21 @@
-# stacksyms.py: requires submodules pyelftools and dwarf_import
+# stacksyms.py: requires submodules pyelftools and dwarf_import.
 # The purpose of this tool is to extract function features and labels
-# from unstripped, compiler-generated ELF files. While it doesn't
-# stricly require debug information (only .eh_frame and .symtab) it
-# certainly helps in generating better ground truth information.
+# for stack symbolization (total frame size, number and size of objects
+# on stack) from unstripped, compiler-generated ELF files. While debug info
+# isn't stricly required (only .eh_frame and .symtab are required) it certainly
+# helps in generating better information. We obtain all information statically.
+# Ideally, it can actually be validated at runtime (e.g, using GDB):
+# (gdb) break {func.name}
+# (gdb) r
+# (gdb) rbreak .
+# (gdb) c
+# (gdb) info frame
+# Now "frame at 0xA" - "called by frame at 0xB" should match our size estimate.
+
 import os
 import logging
+
+from typing import Optional
 
 # TODO: we really need unit tests..
 
@@ -15,18 +26,28 @@ import elftools.dwarf, elftools.elf
 
 from elftools.elf.elffile import ELFFile
 
-from elftools.dwarf.descriptions import ExprDumper, describe_reg_name, describe_CFI_register_rule, describe_CFI_CFA_rule
+from elftools.dwarf.descriptions import ExprDumper, describe_reg_name, \
+     describe_CFI_register_rule, describe_CFI_CFA_rule
 
 from dwarf_import.model.module import Module
-from dwarf_import.model.elements import Component, Parameter, LocalVariable, Location, Type, ScalarType, CompositeType, LocationType, ExprOp
+from dwarf_import.model.elements import Component, Parameter, LocalVariable, \
+     Location, Type, ScalarType, CompositeType, LocationType, ExprOp
 
 from dwarf_import.io.dwarf_expr import ExprEval, LocExprParser
 from dwarf_import.io.dwarf_import import DWARFDB, DWARFImporter
 from dwarf_import.io.dwarf_import import place_component_in_module_tree
 
-import dwarf_import # vector35's dwarf library (helps with types)
-
-from typing import Optional
+# Vector35's dwarf_import library has:
+#   (1) the io classes which deal with ELF/DWARF stuff,
+#   (2) the model classes which are more general, high-level data containers
+#   (3) the parsers themselves (stateful because DWARF contains stack machines)
+# Some things (like lineprograms) are not implemented in any library I looked at.
+#
+# Their DWARF EH_FRAME processing most likely comes from this repo:
+# https://github.com/francesco-zappa-nardelli/eh_frame_check/blob/master/testing/eh_frame_check.py
+# there are some interesting test cases here:
+# https://git.tobast.fr/m2-internship/eh_frame_check_setup
+import dwarf_import
 
 logging.basicConfig(
 #    filename='stacksyms_run.log',
@@ -41,7 +62,8 @@ class Register(dwarf_import.model.elements.Element):
         self.locations = locations # iterable (e.g., set)
         self.number = number # int or str
     def __repr__(self):
-        return f'<Register: number={self.number}, name={self.name}, locations={self.locations}>'
+        return f'<Register: number={self.number}, name={self.name}, ' \
+                        + f'locations={self.locations}>'
 
 class Function(dwarf_import.model.elements.Function):
     @classmethod
@@ -58,13 +80,14 @@ class Function(dwarf_import.model.elements.Function):
             new._attributes = dict(old._attributes)
         return new
     
-    def __init__(self, owner = None, name: str = 'function', start: Optional[int] = None):
+    def __init__(self, owner = None, name: str = 'function', \
+                 start: Optional[int] = None):
         super().__init__(owner, name, start)
         self._is_inline = False
         self._arch = '' # arch string (e.g., 'arm', 'AArch64', 'x86', 'x64')
         self._size = 0  # size of function code in bytes
         self._frame_table = None # FDE or None
-        self._registers = dict()
+        self._registers = dict() # maps register names to locations
         self._code = None # opcode string as bytes object
 
     @property
@@ -93,64 +116,62 @@ class Function(dwarf_import.model.elements.Function):
             return self._code.hex()
         return ''
 
-# Vector35's dwarf_import library has:
-#   (1) the io classes which deal with ELF/DWARF stuff,
-#   (2) the model classes which are more general, high-level data containers
-#   (3) the parsers themselves which are stateful because DWARF contains stack machines
-# We may need all of the above to get what we want, because some things (like lineprograms)
-# are not implemented in dwarf_import (or any other library I looked at).
-#
-# Vector 35's DWARF EH_FRAME processing most likely comes from this repo:
-# https://github.com/francesco-zappa-nardelli/eh_frame_check/blob/master/testing/eh_frame_check.py
-# there are some interesting test cases here https://git.tobast.fr/m2-internship/eh_frame_check_setup
-
 def parseELF(filepath):
-    '''Returns a list of functions for this file (if the file contains frame info section)'''
+    '''Returns a list of functions (if the file contains frame info section)'''
     logging.info(f"Trying to parse {filepath} as ELF")
     elf = ELFFile(open(filepath, 'rb'))
     logging.info(f"ELF file is for architecture {elf.get_machine_arch()}.")
     module, importer = parseDWARF(elf)
-    func_dict = getAllFunctions(module, importer, elf) # a map of int (pc values) -> model.elements.Function
-    frame_tables = collectFrameInfo(func_dict, elf) # int (pc values) -> FDE dict
+    # a map of int (pc values) -> model.elements.Function
+    func_dict = getAllFunctions(module, importer, elf)
+    # int (pc values) -> FDE dict
+    frame_tables = collectFrameInfo(func_dict, elf)
     func_dict = assign_frames(frame_tables, func_dict) # split per function
-    func_dict = processRegisterRuleExpressions(func_dict, importer) # process dynamic register locs
-    func_dict = propagateTypeInfo(func_dict, importer) # element.type.byte_size is often None -> try and fix it
-    func_dict = collectOpcodes(func_dict, elf)
+    # process dynamic register locs
+    func_dict = processRegisterRuleExpressions(func_dict, importer)
+    # element.type.byte_size is often None -> try and fix it
+    func_dict = propagateTypeInfo(func_dict, importer)
+    func_dict = collectOpcodes(func_dict, elf) # read bytes from .text section
     processInlineFunctions(func_dict, importer, elf)
     return func_dict.values()
 
-# TODO: if frame table is indeed missing, try generating it using https://github.com/frdwarf/dwarf-synthesis
+# TODO: if frame table is indeed missing, try generating it
+# e.g., using https://github.com/frdwarf/dwarf-synthesis
 def parseDWARF(elf):
-    '''Look for .eh_frame section and if present, start parsing it (even stripped binaries retain frame info)'''
+    '''Parse .eh_frame section (if present - strip retains frame info)'''
     if elf.has_dwarf_info(): # note that this does NOT mean 'has_debug_info()'
         logging.info("ELF file says it has some frame info..")
-        module = Module() # this is high-level the data model (no deps on ELF/DWARF types etc)
-        dwarfDB = DWARFDB(elf) # this the io data class for parsing
-        importer = DWARFImporter(dwarfDB, dict()) # {'only_concrete_subprograms' : False})
+        module = Module()
+        dwarfDB = DWARFDB(elf) # io data class for parsing
+        # passing {'only_concrete_subprograms' : False}) yields start=0 symbols
+        importer = DWARFImporter(dwarfDB, dict())
         for component in importer.import_components():
             place_component_in_module_tree(module, component)
         return module, importer # importer has state after parsing
-    logging.warn("ELF file does not contain any stack frame information!")
-    return None
+    raise RuntimeError("ELF file does not contain required information!")
 
-# TODO: currently mainly relies on .symtab (or .dynsym).. add support for 3rd party symbol discovery
+# TODO: relies on .symtab or .dynsym -> support externel symbol discovery
 def getAllFunctions(module, importer, elf):
-    '''Returns all function definitions as dwarf_import.model.elements.Function objects.'''
-    # (1) from the .symtab section (name, address, and size only)
+    '''Returns dwarf_import.model.elements.Function objects.'''
+    # from the .symtab section (name, address, and size only)
     func_dict = getFunctionsFromSymtab(elf)
-    # TODO: (2) from the .eh_frame section (no names but frame size and address ranges)
-    # (3) from .debug_info using 'DW_TAG_subprogram' (can miss .start if only_concrete_subprograms=False)
+    # TODO: from .eh_frame (no names but frame size and address ranges)
+    # from .debug_info using 'DW_TAG_subprogram'
     func_dict = getFunctionsFromDWARFInfo(func_dict, module)
     return func_dict
 
-# need to process inline functions to obtain full frame information for parent functions
+# process inline functions to obtain frame information for parent functions
 def processInlineFunctions(func_dict, importer, elf):
-    inlinedFs = {func.start : func for func in getInlined(func_dict.values()) if func.start not in func_dict}
+    inlinedFs = {
+        func.start : func \
+        for func in getInlined(func_dict.values()) \
+        if func.start not in func_dict \
+    }
     if len(inlinedFs) == 0:
         return
     logging.debug(f"Found {len(inlinedFs)} inlined functions.")
     sorted_funcs = sorted(func_dict.values(), key=lambda f : f.start)
-    for func in inlinedFs.values(): # by default, some inlined functions are missing.. we add them here
+    for func in inlinedFs.values():
         func._is_inline = True
         func._arch = elf.get_machine_arch()
         parent = binary_search_function(func.start, sorted_funcs)
@@ -170,7 +191,7 @@ def processInlineFunctions(func_dict, importer, elf):
 # TODO: for some reason, there may be duplicates?
 def getInlined(functions):
     '''Recursively finds all inlined functions'''
-    level = [inlined for func in functions for inlined in func.inlined_functions]
+    level=[inlined for func in functions for inlined in func.inlined_functions]
     if not any(level):
         return functions
     return level + getInlined(level)
@@ -178,26 +199,23 @@ def getInlined(functions):
 def getFunctionsFromSymtab(elf):
     '''Get both local and global symbols from .symtab section.'''
     logging.info('Trying to obtain symbol information.')
-    Register.type._byte_size = getRegisterSize(elf.get_machine_arch()) # TODO per instance would be better
+    Register.type._byte_size = getRegisterSize(elf.get_machine_arch())
     func_dict = dict()
     symtab = elf.get_section_by_name('.symtab')
     if symtab is None:
         logging.warning("Missing .symtab section, trying .dynsym..")
         symtab = elf.get_section_by_name('.dynsym')
         if symtab is None:
-            logging.critical("Missing .symtab and .dynsym sections, cannot obtain symbol information!")
+            logging.critical("Missing .symtab and .dynsym sections, " \
+                             + "cannot obtain symbol information!")
             return func_dict
     for i, symbol in enumerate(symtab.iter_symbols()):
         if symbol['st_info']['type']=='STT_FUNC':
             if symbol['st_value']==0:
                 # for dynamic symbols 'st_value' and 'st_size' will be zero
-                MAX_NO_FUNCS_PER_BINARY = 2**20 # about one mil
-                fake_start = -(abs(hash(symbol.name))%MAX_NO_FUNCS_PER_BINARY)
-                new_func = Function(name=symbol.name, start=fake_start)
-                new_func._arch = elf.get_machine_arch()
-                new_func._size = symbol['st_size']
-                print(new_func._name, new_func._start, new_func._size)
-                func_dict[fake_start] = new_func
+                logging.warn(f"Undefined symbol {symbol.name} (dynamic?)")
+                # FIXME: could add support for shared libraries
+                # -> probably not a good idea for a "static" tool though
             elif symbol['st_value'] not in func_dict:
                 new_func = Function(name=symbol.name, start=symbol['st_value'])
                 new_func._arch = elf.get_machine_arch()
@@ -214,10 +232,10 @@ def getFunctionsFromDWARFInfo(func_dict, module):
             logging.debug(f'Recursing into module {m}')
             getFunctionsFromDWARFInfo(func_dict, m)
         elif isinstance(m, Component):
-            logging.debug(f'Found {len(m.functions)} function definitions in component {m.name}')
+            logging.debug(f'{len(m.functions)} functions in component {m.name}')
             func_dict = mergeSymtabDWARF(func_dict, m.functions)
         else:
-            logging.critical(f'Child node is neither Module nor Component ({type(m), m}).')
+            logging.critical(f'Neither Module nor Component ({type(m), m}).')
     return func_dict
 
 def mergeSymtabDWARF(symtab_funcs, dwarf_funcs):
@@ -225,14 +243,18 @@ def mergeSymtabDWARF(symtab_funcs, dwarf_funcs):
         if dwarf_func.start is None: # try to match it by name
             for symtab_func in symtab_funcs.values():
                 if symtab_func.name == dwarf_func.name:
-                    logging.info(f'Found missing address from symtab info for {dwarf_func.name}.')
+                    logging.info(f'Found missing address from symtab' \
+                                 + f'for {dwarf_func.name}.')
                     dwarf_func.start = symtab_func.start
                     break
             else: # this case only hits if we did not break the inner loop
-                logging.info(f'Skipping abstract function {dwarf_func.name} (missing address).')
-                continue # we then skip processing in the outer loop (because there's no matching function)
-        if dwarf_func.start in symtab_funcs: # merge symtab and DWARF symbols by address
-            logging.debug(f'Merging symtab and dwarf info for {dwarf_func.name}@{hex(dwarf_func.start)}.')
+                logging.info(f'Skipping abstract function ' \
+                             + f'{dwarf_func.name} (missing address).')
+                continue # skip outer loop (no matching function)
+        # try merging symtab and DWARF symbols by address
+        if dwarf_func.start in symtab_funcs:
+            logging.debug(f'Merging symtab and dwarf info for ' \
+                          + '{dwarf_func.name}@{hex(dwarf_func.start)}.')
             symtab_func = symtab_funcs[dwarf_func.start]
             new_func = Function.fromDWARFFunction(dwarf_func)
             new_func._size  = symtab_func.size
@@ -242,7 +264,8 @@ def mergeSymtabDWARF(symtab_funcs, dwarf_funcs):
     return symtab_funcs
 
 def collectFrameInfo(func_dict, elf):
-    '''Parses .eh_frames to collect frame tables per function (specified in DWARF Standard Section 6.4.1)'''
+    '''Parses .eh_frames to collect frame tables per function
+       (specified in DWARF Standard Section 6.4.1)'''
     from elftools.dwarf.callframe import CIE, FDE, ZERO
     dwarfInfo = elf.get_dwarf_info()
     if dwarfInfo.has_EH_CFI(): # ez
@@ -250,19 +273,23 @@ def collectFrameInfo(func_dict, elf):
         cfi_entries = dwarfInfo.EH_CFI_entries()
         frame_tables = dict() # func.start -> frame description entry (FDE)
         for entry in cfi_entries: # FDEs or CIEs
-            if isinstance(entry, FDE): # CIEs don't specify initial locations, only FDEs do
+            if isinstance(entry, FDE): # CIEs don't specify location (FDEs do)
                 fpc = entry['initial_location']
                 func = func_dict[fpc] if fpc in func_dict else None
                 if func is None:
-                    logging.warn(f"FDE/CIE for address {hex(entry['initial_location'])} without matching symbol.")
+                    logging.warn("FDE/CIE for address " \
+                                 + f"{hex(entry['initial_location'])} " \
+                                 + "without matching symbol.")
                     continue
                 frame_tables[func.start] = entry
-        return frame_tables
-    logging.critical('File does not contain .eh_frames section') # TODO: handle .debug_frames
+        return frame_tables # TODO: handle .debug_frames
+    logging.critical('File does not contain .eh_frames section')
     return func_dict
 
 def binary_search_function(address, sorted_functions):
-    '''Finds the function among the provided list that best matches the provided address (assuming linearly sorted func.start values and a contiguous code region)'''
+    '''Finds the function among the provided list that best matches the provided
+       address (assuming linearly sorted func.start values and a contiguous code
+       region).'''
     left = 0
     right = len(sorted_functions)-1
     while left <= right:
@@ -280,15 +307,16 @@ def binary_search_function(address, sorted_functions):
     return None
 
 def assign_frames(frame_tables, func_dict):
-    '''Assigns FDEs from frame_tables dict to functions by address matching fde['pc'] with func.start'''
+    '''Assign FDEs to functions by address matching fde['pc'] with func.start'''
     for func in func_dict.values():
         func._frame_table = None
         if func.start not in frame_tables:
             if not func.is_inline:
-                logging.critical(f"No frame table for {func.name}@{hex(func.start)}!")
+                logging.critical(f"No frame table for " \
+                               + f"{func.name}@{hex(func.start)}!")
             continue
-        entry = frame_tables[func.start] # FDE for function as defined in .eh_frames section
-        decoded_table = entry.get_decoded() # elftools.dwarf.callframe.DecodedCallFrameTable
+        entry = frame_tables[func.start] # FDE
+        decoded_table = entry.get_decoded() # DecodedCallFrameTable
         if len(decoded_table) == 0:
             logging.warn(f'Frame table for function {func.name} is empty!')
             continue
@@ -296,51 +324,53 @@ def assign_frames(frame_tables, func_dict):
     return func_dict
 
 def processRegisterRuleExpressions(func_dict, importer):
-    '''Process per function frame tables to create Location objects for all registers stored on the stack'''
-    # TODO this is a hack, should be part of the dwar_import processing.. maybe create a patch later
-    # TODO right now, we are missing inlined functions that don't have their own frame table (some do)
+    '''Process frame tables to create locations for registers on the stack'''
+    # TODO this is a hack, should be part of the dwar_import processing..
+    # TODO missing inlined functions without their own frame table (some do)
     for func in func_dict.values():
         if func.frame_table is not None:
             decoded_table = func.frame_table.get_decoded()
             ra_regnum = func.frame_table.cie['return_address_register']
-            reg_order = sorted(filter(lambda r : r != ra_regnum, decoded_table.reg_order))
-            for line in func.frame_table.get_decoded().table: # process the entire function body
-                if 'cfa' in line: # canonical frame address rule for this line
+            gp = [r for r in decoded_table.reg_order if r != ra_regnum]
+            for line in func.frame_table.get_decoded().table:
+                if 'cfa' in line: # canonical frame address rule
                     processCFARule(line, func, importer)
-                for regNo in reg_order: # general purpose register rules for this line
-                    if regNo in line:
-                        processRegisterRule(regNo, line, func, importer)
+                for reg in sorted(gp): # general purpose register rules
+                    if reg in line:
+                        processRegisterRule(reg, line, func, importer)
     return func_dict
 
 def processCFARule(line, func, importer):
     pc = line['pc'] # start address for rules in this line
     cfa_loc = None
     if line['cfa'].expr:
-        cfa_loc = importer._location_factory.make_location(pc, 0, line['cfa'].expr)
+        cfa_loc=importer._location_factory.make_location(pc,0,line['cfa'].expr)
     else:  # tuple (0, ) unifies access to [1] in all cases later
-        cfa_loc = Location(pc, 0, LocationType.STATIC_LOCAL, (0, line['cfa'].offset))
+        cfa_loc=Location(pc,0,LocationType.STATIC_LOCAL,(0,line['cfa'].offset))
     if 'cfa' not in func._registers:
-        func._registers['cfa'] = Register('cfa', describe_reg_name(line['cfa'].reg, func.arch), set())
+        regname = describe_reg_name(line['cfa'].reg, func.arch)
+        func._registers['cfa'] = Register('cfa', regname, set())
     if cfa_loc is not None:
         func._registers['cfa'].locations.update({cfa_loc})
     else:
-        logging.critical(f"Can't parse location for CFA rule {describe_CFI_CFA_rule(line['cfa'])} in {func.name}.")
+        logging.critical(f"{describe_CFI_CFA_rule(line['cfa'])}@{func.name}.")
 
 def processRegisterRule(regNo, line, func, importer):
     pc = line['pc'] # start address for rules in this line
-    loc = None # FIXME some locs here cause weird stack layout (e.g., [8,8,4,1,4,8] -> why 1)???
-    if line[regNo].type in ['OFFSET', 'VAL_OFFSET']: # LocFactory raises a TypeError in this case
+    loc = None
+    if line[regNo].type in ['OFFSET', 'VAL_OFFSET']:
         loc = Location(pc, 0, LocationType.STATIC_LOCAL, (0, line[regNo].arg))
     elif line[regNo].type in ['EXPRESSION', 'VAL_EXPRESSION']:
         loc = importer._location_factory.make_location(pc, 0, line[regNo].arg)
         if loc is None:
-            logging.critical(f"Can't parse loc expr {describe_CFI_register_rule(line[regNo])} ({func.name}).")
+            logging.critical(f"Location was 'None' for regrule in {func.name}:")
+            logging.critical(f"{describe_CFI_register_rule(line[regNo])}.")
             return
-    else: # in this case we don't have a stack location but, e.g., another register
-        logging.debug(f"No stack locs for {describe_CFI_register_rule(line[regNo])} in {func.name}.")
+    else: # no stack location
         return
     if regNo not in func._registers:
-        func._registers[regNo] = Register(regNo, describe_reg_name(regNo, func.arch), set())
+        regname = describe_reg_name(regNo, func.arch)
+        func._registers[regNo] = Register(regNo, regname, set())
     func._registers[regNo].locations.update({loc})
 
 def getRegisterSize(arch):
@@ -361,46 +391,50 @@ def propagateTypeInfo(func_dict, importer):
         arch = function.arch
         for parameter in function.parameters:
             if parameter.type is None:
-                logging.warn(f"Parameter {parameter} has 'None' Type association!")
+                logging.warn(f"Parameter {parameter} has 'None' type.")
                 continue
             types |= {parameter.type}
         for variable in function.variables:
             if variable.type is None:
-                logging.warn(f"Variable {variable} has 'None' Type association!")
+                logging.warn(f"Variable {variable} has 'None' type.")
                 continue
             types |= {variable.type}
-    logging.debug(f"Type list for functions: {types}")
+    logging.debug(f"Type list for functions: {types}.")
     for _type in types:
         if not _type.is_qualified_type or _type.byte_size is None:
-            if _type.array_count is not None:
-                # TODO there was a bug with pointer arrays here.. seems to work for now??
-                if _type.element._scalar_type==ScalarType.POINTER_TYPE: # regular ptrs
-                    if _type.byte_size is None:
-                        _type._byte_size = _type.array_count * getRegisterSize(arch)
+            if _type.array_count is not None: # arrays
+                if _type.element._scalar_type==ScalarType.POINTER_TYPE:
+                    if _type.byte_size is None: # data pointers
+                        _type._byte_size = _type.array_count \
+                            * getRegisterSize(arch)
                         continue
-                if resolveType(_type, True)._scalar_type == ScalarType.POINTER_TYPE: # code ptrs
+                elif resolveType(_type, True)._scalar_type \
+                     == ScalarType.POINTER_TYPE: # code pointers
                     if _type.byte_size is None:
-                        _type._byte_size = _type.array_count * getRegisterSize(arch)
+                        _size = _type.array_count * getRegisterSize(arch)
+                        _type._byte_size = _size
                         continue
-                if _type.byte_size is None: # non-pointer arrays
+                elif _type.byte_size is None: # non-pointer arrays
                     arrayType = resolveType(_type)
                     if arrayType.byte_size is not None:
-                        _type._byte_size = _type.array_count * arrayType.byte_size # TODO check this
+                        _size = _type.array_count * arrayType.byte_size
+                        _type._byte_size = _size
                         continue
                 logging.critical(f"Cannot resolve array type {_type}")
-            elif _type.composite_type is not None:
-                if _type.byte_size is None:
-                    logging.critical(f"Can't yet handle type {_type} with composite {_type.composite_type}!") # FIXME implement this
+            elif _type.composite_type is not None: # FIXME implement this
+                if _type.byte_size is None: 
+                    logging.critical(f"Can't yet handle type {_type} with " \
+                                   + f"composite {_type.composite_type}!")
             elif _type.element is not None: # this is the frequent case
                 base = resolveType(_type)
                 if base.byte_size is None:
-                    logging.warn(f"Type propagation for type {base} yields size 'None'!")
+                    logging.warn(f"Resolving type {base} yields size 'None'!")
                     continue
-                _type._byte_size = base._byte_size # TODO check this
+                _type._byte_size = base._byte_size
     return func_dict
 
 def resolveType(_type, secondToLast=False):
-    if secondToLast: # this case is mainly to find function pointer arrays (e.g., 'void()*[100]')
+    if secondToLast: # find function pointer arrays (e.g., 'void()*[100]')
         if _type.element is not None and _type.element.element is not None:
             if _type.element.element.element is None:
                 if _type.element._composite_type == CompositeType.FUNCTION_TYPE:
@@ -409,98 +443,42 @@ def resolveType(_type, secondToLast=False):
             return resolveType(_type.element, secondToLast)
     return _type if _type.element is None else resolveType(_type.element)
 
-# There are different ways we could try to get a number for the stack frame size of a binary
-# function statically, but none of them seems satisfactory for various reasons.
-# Specficially, we can obtain per-function frame sizes statically by:
-# (1) emitting stack size during compilation ("-fstack-usage")
-# (2) counting pushs and pops, also considering "sub 0x48, rsp" type instructions
-# (3) looking at the maximal offset of the cfa column in the function's .eh_frame table
-# (4) collecting all stack elements from 'DW_TAG_variable' and 'DW_TAG_formal_parameter',
-#     calculating their respective sizes, and summing up the total size.
-# The first option is obviously going to be compiler and architecture-specific, limited to programs
-# where source code and target compiler are both available. These constraints are quite limiting.
-# The second option works reasonably well in practice, but requires accurate disassembly and modeling
-# of stack operations for each architecture (TODO: are there other downsides???).
-# The third option may provide an actual number most of the time, but compilers may decide to keep the
-# base pointer in a register and never write it to the stack (in which case cfa offset is REGISTER+0).
-# The fourth option requires reliable and complete type information, which is usually not available.
-def getMaxFrameSize(function):
-    '''Get maximum frame size of a function based on its .eh_frame entry.
-       The number we obtain here statically can actually be validated at runtime (e.g, using GDB):
-       $ gdb path/to/prog
-       (gdb) set confirmation off
-       (gdb) break {func.name}
-       (gdb) r
-       (gdb) rbreak .
-       (gdb) c
-       (gdb) info frame
-       At this point "frame at 0xADDRESS_A" - "called by frame at 0xADDRESS_B" should match our number below'''
-    # TODO: the approach in comments here would require successful symbolization.. but we're not there yet
-    inlined = [getStackElements(inlined) for inlined in function.inlined_functions]
-    logging.debug(f"Got {len(inlined)} inlined functions for {function.name}")
-    possibleStackElements = [function.parameters, function.variables, function.registers] + inlined
-    #offsets = [0]+[loc.expr[1] for stkElm in filter(len, possibleStackElements) for loc in getStackLocations(stkElm)]
-    #print(offsets)
-    #return max(map(abs, max(map(abs, offsets)))) # maximal stack offset across all elements
-    return max(map(abs,map(getMaxOff, possibleStackElements + inlined)))
-
-def getMaxOff(stkElms): # maximal stack offset across all elements
-   return max(map(abs,[0]+[loc.expr[1] for stkElm in stkElms for loc in getStackLocations(stkElm)]))
+def getMaxFrameSize(func):
+    inlined = [getStackElements(inlined) for inlined in func.inlined_functions]
+    logging.debug(f"Got {len(inlined)} inlined stack slots for {func.name}")
+    stack = func.parameters + func.variables + func.registers + inlined
+    locations = [0]+[
+        loc.expr[1] for stkElm in stack for loc in getStackLocations(stkElm)
+    ]
+    return max(map(abs, locations))
 
 def getMaxFrameSizeCFA(function):
+    cfaLocExprs = [0]
     if 'cfa' in function._registers:
-        # return max(line['cfa'].offset for line in function.frame_table.table)
-        return max([0] + [loc.expr[1] for loc in getStackLocations(function._registers['cfa'])])
-        '''
-        cfa_locs_with_exprs = list(filter(lambda reg : reg.location.expr is not None, cfa_rules))
-        if any(cfa_locs_with_exprs): # seems to be rare, but we might be skipping over offsets here.. logging
-            logging.info("Binary contains register rule expression for canonical frame address, skipping:")
-            ra_regnum = function.frame_table.cie['return_address_register']
-            logging.info(f"return address in register {ra_regnum} ({describe_reg_name(ra_regnum, function.arch)}")
-            expr_dumper = ExprDumper(function.frame_table.structs)
-            for loc in cfa_locs_with_exprs:
-                logging.info(f"Skipping Expression: {expr_dumper.dump_expr(loc.expr)}")
-                cfa_rules.remove(cfar)
-        return max(loc.offset for cfa in cfa_rules)
-        '''
-    logging.critical(f"No canonical frame address for {function.name}.. returning zero!")
-    return 0
+        for loc in getStackLocations(function._registers['cfa']):
+            cfaLocExprs += [loc.expr[1]]
+    return max(cfaLocExprs)
 
-def generateDebugLabel(func):
-    funElms  = len(func.parameters) + len(func.variables) + len(func.registers)
-    inlinedStackElms = [getStackElements(inlined) for inlined in func.inlined_functions]
-    stkSlots = sorted(getStackElements(func) + inlinedStackElms, key=getMaxStackOff)
-    if len(stkSlots) != funElms:
-        logging.info(f"Function {func.name} has {len(stkSlots)} stack elements out of {funElms} total.")
-    logging.debug(f"{func.name} => [{', '.join(stkElm.name+'@ebp%+d'%getMaxStackOff(stkElm) for stkElm in stkSlots)}]")
-    retaddr = getRegisterSize(func.arch)
-    return [retaddr] + [stkElm.type.byte_size for stkElm in stkSlots]
-
-# FIXME for some reason Location.pc may be 0 for some local variables, even if line['pc'] is nonzero
+# FIXME Location.pc may be 0 for some local variables, even if line['pc'] != 0
 def getStackElements(function):
     '''return stack elements (in no particular order)'''
     candidates = function.parameters + function.variables + function.registers
-    logging.debug(f"Function {function.name}@{function.start} has {len(candidates)} potential stack elements.")
     return [stkElm for stkElm in candidates if any(getStackLocations(stkElm))]
-
-def getMaxStackOff(stkElm): # maximal stack offset for a single element
-    stkLocs = getStackLocations(stkElm)
-    logging.debug(f"Stack element {stkElm} has {len(stkLocs)} stack locations (there might be more non-stack locations for this object).")
-    return max(map(lambda stkLoc : abs(stkLoc.expr[1]), stkLocs))
 
 # stkElm can be Register, LocalVariable, or Parameter
 def getStackLocations(stkElm):
     return [loc for loc in stkElm.locations if locExprHasOffset(loc)]
 
 def locExprHasOffset(location): # TODO y0 d4wg, this sh!t is sketchy as f*&^
-    if location.type in [LocationType.STATIC_GLOBAL, LocationType.STATIC_LOCAL]: # FIXME with LocationType.DYNAMIC we get 'None' sized objects on the stack
+    # FIXME with LocationType.DYNAMIC we get 'None' sized objects on the stack
+    if location.type in [LocationType.STATIC_GLOBAL, LocationType.STATIC_LOCAL, LocationType.DYNAMIC]:
         return len(location.expr) > 1 and type(location.expr[1]) == int
     return False
 
+# inspired by 'readelf -x'
 def collectOpcodes(func_dict, elf):
     '''pyelftools standalone opcode retrieval (should be fast)'''
     from elftools.elf.constants import SH_FLAGS
-    # inspired by 'readelf -x'
     code_sections = {}
     for section in elf.iter_sections():
         if section['sh_flags'] & SH_FLAGS.SHF_EXECINSTR:
@@ -538,42 +516,75 @@ def checkLabels(functions, want_analysis=False):
             funclabel['out'] = generateDebugLabel(func)
             funclabel['maxCFA'] = getMaxFrameSizeCFA(func)
             if want_analysis: # requires capstone
-                stack, maxstack = disassembleAndAnalyzeSymbolically(func)
+                stackops, maxstack = disassembleAndAnalyzeSymbolically(func)
                 funclabel['maxANA'] = maxstack
-                funclabel['outANA'] = stack[1:]
-                logging.debug(f"{func.name} ({funclabel['max']} / {sum(funclabel['out'])} / {funclabel['maxCFA']} / {funclabel['maxANA']}) => {funclabel['out']} / {funclabel['outANA']}")
+                funclabel['outANA'] = stackops
+                logging.info(f"{func.name} ({funclabel['max']} / {sum(funclabel['out'])} / {funclabel['maxCFA']} / {funclabel['maxANA']}) => {funclabel['out']} / {funclabel['outANA']}")
             else:
-                logging.debug(f"{func.name} ({funclabel['max']} / {sum(funclabel['out'])} / {funclabel['maxCFA']}) => {label}")
+                logging.info(f"{func.name} ({funclabel['max']} / {sum(funclabel['out'])} / {funclabel['maxCFA']}) => {funclabel['out']}")
             allLabels[func.name] = funclabel
     return allLabels
 
+def generateDebugLabel(func):
+    funElms  = len(func.parameters) + len(func.variables) + len(func.registers)
+    inlinedStackElms = [getStackElements(inlined) for inlined in func.inlined_functions]
+    stkSlots = sorted(getStackElements(func) + inlinedStackElms, key=getMaxStackOff)
+    if len(stkSlots) != funElms:
+        logging.info(f"Function {func.name} has {len(stkSlots)} stack elements out of {funElms} total.")
+    logging.debug(f"{func.name} => [{', '.join(stkElm.name+'@ebp%+d'%getMaxStackOff(stkElm) for stkElm in stkSlots)}]")
+    stack = [
+        stkElm.type.byte_size if stkElm.type.byte_size is not None
+        else 0 # e.g., if type propagation failed for that slot
+        for stkElm in stkSlots
+    ]
+    return stack # NoneTypes slots are 0
+
+def getMaxStackOff(stkElm): # maximal stack offset for a single element
+    stkLocs = getStackLocations(stkElm)
+    logging.debug(f"Stack element {stkElm} has {len(stkLocs)} stack locations.")
+    return max(map(lambda stkLoc : abs(stkLoc.expr[1]), stkLocs))
+
+# We do a single linear sweep. While this is fast, it may be inaccurate.
+# One could in principle use a symbolic execution engine (e.g. angr),
+# however, in general more complex analyses may not even converge.
 def disassembleAndAnalyzeSymbolically(func):
     if func.arch == 'x64':
         return disasAndAnalyzeStackAMD64(func)
     elif func.arch == 'AArch64':
         return disasAndAnalyzeStackAArch64(func)
+    elif func.arch == 'x86':
+        return disasAndAnalyzeStackAMD64(func, m32=True)
+    raise RuntimeError(f"Architecture {func.arch} is not supported yet!")
 
-def disasAndAnalyzeStackAMD64(func):
+def disasAndAnalyzeStackAMD64(func, m32=False):
     import re; import capstone
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
     non_hexdigits = re.compile(r'[^\dx]+')
+    md.detail = True
+    regsize = 8 if not m32 else 4
     maxstack = 0
-    stack = [0]
+    stackops = []
     for i in md.disasm(bytes.fromhex(func.code), func.start):
         if i.mnemonic == 'push':
-            stack += [8]
+            stackops += [regsize]
         elif i.mnemonic == 'pop':
-            stack += [-8]
-        elif 'rsp' in i.op_str or 'esp' in i.op_str:
-            if i.mnemonic == 'sub':
-                stack += [int(i.op_str.split(' ')[1], 16)]
-            elif i.mnemonic == 'add':
-                stack += [-int(i.op_str.split(' ')[1], 16)]
-            else:
-                raise RuntimeError(f"0x{hex(i.address)}:\t{i.mnemonic}\t{i.op_str}")
-        _sum  = sum(stack)
+            stackops += [-regsize]
+        elif 'sp' in i.op_str:
+            regs_read, regs_write = i.regs_access()
+            if 0 < len(regs_write) and 'sp' in [i.reg_name(r) for r in regs_write]:
+                if i.mnemonic == 'sub':
+                    stackops += [int(i.op_str.split(' ')[1], 16)]
+                elif i.mnemonic == 'add':
+                    stackops += [-int(i.op_str.split(' ')[1], 16)]
+                elif i.mnemonic == 'mov':
+                    pass # FIXME I guess we can't do much here?
+                elif i.mnemonic in ['lea', 'cmp']:
+                    pass
+                else:
+                    raise RuntimeError(f"0x{hex(i.address)}:\t{i.mnemonic}\t{i.op_str}")
+        _sum  = sum(stackops)
         maxstack = _sum if maxstack < _sum else maxstack
-    return stack, maxstack
+    return stackops, maxstack
 
 def disasAndAnalyzeStackAArch64(func):
     import re; import capstone
@@ -581,138 +592,22 @@ def disasAndAnalyzeStackAArch64(func):
     md.detail = True
     non_hexdigits = re.compile(r'[^\dx]+')
     maxstack = 0
-    stack = [0]
+    stackops = []
     for i in md.disasm(bytes.fromhex(func.code), func.start):
         if 'sp' in i.op_str:
             regs_read, regs_write = i.regs_access()
             if 0 < len(regs_write) and 'sp' in [i.reg_name(r) for r in regs_write]:
                 split = i.op_str.split(' ')
                 if i.mnemonic == 'stp':
-                    stack += [int(non_hexdigits.sub('', split[3]), 16)]
+                    stackops += [int(non_hexdigits.sub('', split[3]), 16)]
                 elif i.mnemonic == 'ldp':
-                    stack += [-int(non_hexdigits.sub('', split[3]), 16)]
+                    stackops += [-int(non_hexdigits.sub('', split[3]), 16)]
                 elif i.mnemonic in ['sub', 'str']:
-                    stack += [int(non_hexdigits.sub('', split[2]), 16)]
+                    stackops += [int(non_hexdigits.sub('', split[2]), 16)]
                 elif i.mnemonic in ['add', 'ldr']:
-                    stack += [-int(non_hexdigits.sub('', split[2]), 16)]
+                    stackops += [-int(non_hexdigits.sub('', split[2]), 16)]
                 else:
                     raise RuntimeError(f"0x{hex(i.address)}:\t{i.mnemonic}\t{i.op_str}")
-        _sum  = sum(stack)
+        _sum  = sum(stackops)
         maxstack = _sum if maxstack < _sum else maxstack
-    return stack, maxstack
-
-# TODO Unused. At the moment we're not using control flow to improve our heuristic stack frame measure..
-def isOnStack(variable):
-    # TODO This should probably be named "isOnStackInInitialFrame" or sth like that.
-    # The goal here is to determine if a dwarf_import.model.elements.Variable is on stack or not
-    # when we enter the first frame of the function.. it's not trivial, we have to determine:
-    # (1) if there is a location at all (could have been optimized out)
-    # (2) if so, whether its _first_ reported location is in the range
-    #     of the first basic block of the function.. otherwise its
-    #     creation is dependent on the function's control flow.
-    # (3) if so, whether the location isn't actually a register.
-    # (4) if so, return the offset from frame base along with its size
-    if len(variable.locations)==0:
-        return False
-    if variable.type == LocationType.STATIC_GLOBAL:
-        return not isInReg(variable)
-    return False
-
-# TODO Unused. At the moment we're not using control flow to improve our heuristic stack frame measure..
-def isInReg(variable): # TODO should be named "isInRegInInitialFrame"
-    initFrameLoc = variable.locations[0]
-    if len(initFrameLoc) == 1:
-        return True # TODO: implement the check
-    return False
-
-# SLOW: Unused, can be removed at some point.
-def collectDisassemblyObjdump(functions, filepath):
-    import subprocess
-    logging.info('Trying to collect function disassembly via objdump..')
-    filedisas = subprocess.getoutput(f"objdump -r -j .text -d {filepath}")
-    cut1, cut2 = "cut -d: -f2", "awk -F'\t' '{print $2}'"
-    procs = [] # subprocesses run in parallel
-    for func in functions: # we use awk for cut2 since cut doesn't like Python's TAB insertion
-        function = f"awk -v RS= '/^[[:xdigit:]]+ <{func.name}>/'"
-        proc = subprocess.Popen(' | '.join([function, cut1, cut2]), shell=True, \
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        out, err = proc.communicate(input=bytes(filedisas, encoding='utf-8'))
-        if len(err) != 0:
-            logging.warn(f"Error during disassembly of {func.name}: " + err.decode('utf-8'))
-        lines = out.decode('utf-8').strip().split('\n')
-        func._code = ' '.join(map(lambda s : s.replace(' ', ''), lines))
-    for p in procs:
-        p.wait() # wait for all of them before returning
-    return functions
-
-# SUPER SLOW: Unused, can be removed at some point.
-def collectDisassemblyGDB(gdbmi, functions, debugFilepath):
-    logging.info('Trying to collect function disassembly via GDB..')
-    disasQueries = [f'disas /r {func.name}' for func in functions]
-    gdbOut = staticGDB(gdbmi, debugFilepath, functions, disasQueries)
-    for disas, func in zip(gdbOut, functions):
-        func._code = [tuple(line.strip().split('\\t')) for line in disas[1:-1]]
-    return functions
-
-# SUPER SLOW: use GDB for validation only
-def validateWithGDB(functions, filepath, _gdbmi):
-    '''Collects the same info we parsed from .eh_frames section manually using GDB's output for validation.'''
-    from pygdbmi.gdbcontroller import GdbController
-    logging.info("Attempting to validate frame size and stack symbolization info using GDB..")
-    if _gdbmi is None:
-        _gdbmi = GdbController() 
-    functions = collectLocals(_gdbmi, functions, filepath)
-    functions = collectDisassembly(_gdbmi, functions, filepath)
-    if _gdbmi is None:
-        _gdbmi.exit()
-    return functions
-
-# SUPER SLOW: collects function locals via GDBs 'info scope function' command
-def collectLocalsGDB(gdbmi, functions, debugFilepath):
-    logging.info("Trying to collect stack locals via GDB..")
-    scopeQueries = [f"info scope {func.name}" for func in functions]
-    gdbOut = staticGDB(gdbmi, debugFilepath, functions, scopeQueries)
-    for scope, func in zip(gdbOut, functions):
-        symbol, size, off = None, None, None
-        for line in scope: # depends on line order of GDB output
-            if line.find('Symbol') != -1: # Symbol name comes first
-                symbolName = line.split(' ')[1]
-                logging.debug(f"Found stack element {symbolName}.")
-                size, off = None, None
-                symbol = next((p for p in func.parameters if symbolName==p.name), None)
-                if symbol is None:
-                    logging.debug("Not a parameter, maybe local?")
-                    symbol = next((l for l in func.variables if symbolName==l.name), None)
-                    if symbol is None:
-                        logging.warning(f"Stack symbol {symbolName} reported by GDB but not by PyELFTools.")
-                        continue
-                logging.debug(f"Found scope info for stack element {symbol}")
-            elif symbol is not None and line.find("length") != -1: # Size usually comes last
-                size = int(line[line.find('length') + 6 : -3])
-                logging.debug(f"GDB reports size info ({size} bytes)!")
-                logging.info("Locations: " + str(list(map(lambda loc : f"begin={hex(loc.begin)}, end={hex(loc.end)}", symbol.locations))))
-                if symbol.type.byte_size is None:
-                    logging.warning(f"Setting previously unknown size to {size} bytes!")
-                    symbol.type._byte_size = size
-                elif symbol.type.byte_size != size:
-                    logging.warning(f"GDB size ({size}) and PyELFTtools size ({symbol.type.byte_size}) differ!")
-                else:
-                    logging.debug("GDB size and PyELFTools size are equal.")
-            elif symbol is not None and line.find("DW_OP_fbreg") != -1: # Location second (maybe multiple, but focus on frame offsets)
-                if not any(symbol.locations):
-                    off = line.split(' ')[6::]
-                    begin = int(off[1][0:-2])
-                    loc = Location(begin, 0, LocationType.STATIC_LOCAL, off)
-                    logging.info(f"Adding location {loc}.")
-                    symbol.add_location(loc)
-                logging.debug("Has stack location!")
-    return functions
-
-# SUPER SLOW
-def staticGDB(gdbmi, filepath, functions, queries):
-    """Obtains additional info about stack variables from GDB (w/o running the binary)."""
-    logging.info(f"Loading {filepath} statically in GDB.")
-    result = [gdbmi.write(f"-file-exec-and-symbols {filepath}")]
-    for q in queries:
-        result += [[msg["payload"] for msg in gdbmi.write(q) if msg["type"]=="console"]]
-    return result[1:] # skip meta output
+    return stackops, maxstack
