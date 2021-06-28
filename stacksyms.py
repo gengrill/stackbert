@@ -6,6 +6,8 @@
 import os
 import logging
 
+# TODO: we really need unit tests..
+
 # force local import of pyelftools
 import sys; sys.path.insert(0, 'pyelftools')
 import elftools
@@ -102,11 +104,6 @@ class Function(dwarf_import.model.elements.Function):
 # https://github.com/francesco-zappa-nardelli/eh_frame_check/blob/master/testing/eh_frame_check.py
 # there are some interesting test cases here https://git.tobast.fr/m2-internship/eh_frame_check_setup
 
-def parseDirectory(dirPath):
-    fmap = {fname : parseELF(dirPath + os.sep + fname) for fname in next(os.walk(dirPath))[2]}
-    logging.info(f"Found {sum(map(len,functions))} functions total in {len(functions)} files.")
-    return fmap
-
 def parseELF(filepath):
     '''Returns a list of functions for this file (if the file contains frame info section)'''
     logging.info(f"Trying to parse {filepath} as ELF")
@@ -136,13 +133,7 @@ def parseDWARF(elf):
     logging.warn("ELF file does not contain any stack frame information!")
     return None
 
-# I noticed this used to do a bad job at finding functions for some files, e.g., it
-# only detected 2 functions for "data/cross-compile-dataset/bin/static/gcc/o1/pee".
-# This seems to be a limitation of dwarf_import, because it relies on the information
-# provided in the '.debug_info' section to find functions. That may however not be very
-# reliable.. I added two alternatives that I think should do a better job below.
-# If we also change the "is_concrete" requirement as a default import setting for DWARFImporter
-# it will import 13 functions (as opposed to 2) but curiously miss start address and size info.
+# TODO: currently mainly relies on .symtab (or .dynsym).. add support for 3rd party symbol discovery
 def getAllFunctions(module, importer, elf):
     '''Returns all function definitions as dwarf_import.model.elements.Function objects.'''
     # (1) from the .symtab section (name, address, and size only)
@@ -191,11 +182,23 @@ def getFunctionsFromSymtab(elf):
     func_dict = dict()
     symtab = elf.get_section_by_name('.symtab')
     if symtab is None:
-        logging.critical("Missing .symtab section!")
-        return func_dict
+        logging.warning("Missing .symtab section, trying .dynsym..")
+        symtab = elf.get_section_by_name('.dynsym')
+        if symtab is None:
+            logging.critical("Missing .symtab and .dynsym sections, cannot obtain symbol information!")
+            return func_dict
     for i, symbol in enumerate(symtab.iter_symbols()):
         if symbol['st_info']['type']=='STT_FUNC':
-            if symbol['st_value'] not in func_dict:
+            if symbol['st_value']==0:
+                # for dynamic symbols 'st_value' and 'st_size' will be zero
+                MAX_NO_FUNCS_PER_BINARY = 2**20 # about one mil
+                fake_start = -(abs(hash(symbol.name))%MAX_NO_FUNCS_PER_BINARY)
+                new_func = Function(name=symbol.name, start=fake_start)
+                new_func._arch = elf.get_machine_arch()
+                new_func._size = symbol['st_size']
+                print(new_func._name, new_func._start, new_func._size)
+                func_dict[fake_start] = new_func
+            elif symbol['st_value'] not in func_dict:
                 new_func = Function(name=symbol.name, start=symbol['st_value'])
                 new_func._arch = elf.get_machine_arch()
                 new_func._size = symbol['st_size']
@@ -435,8 +438,14 @@ def getMaxFrameSize(function):
     # TODO: the approach in comments here would require successful symbolization.. but we're not there yet
     inlined = [getStackElements(inlined) for inlined in function.inlined_functions]
     logging.debug(f"Got {len(inlined)} inlined functions for {function.name}")
-    possibleStackElements = [function.parameters, function.variables, function.registers]
+    possibleStackElements = [function.parameters, function.variables, function.registers] + inlined
+    #offsets = [0]+[loc.expr[1] for stkElm in filter(len, possibleStackElements) for loc in getStackLocations(stkElm)]
+    #print(offsets)
+    #return max(map(abs, max(map(abs, offsets)))) # maximal stack offset across all elements
     return max(map(abs,map(getMaxOff, possibleStackElements + inlined)))
+
+def getMaxOff(stkElms): # maximal stack offset across all elements
+   return max(map(abs,[0]+[loc.expr[1] for stkElm in stkElms for loc in getStackLocations(stkElm)]))
 
 def getMaxFrameSizeCFA(function):
     if 'cfa' in function._registers:
@@ -457,10 +466,6 @@ def getMaxFrameSizeCFA(function):
     logging.critical(f"No canonical frame address for {function.name}.. returning zero!")
     return 0
 
-# for LLVM max of abs gets better results than min ("git diff --no-index --word-diff=color --word-diff-regex=. new old")
-def getMaxOff(stkElms): # maximal stack offset across all elements
-   return max(map(abs,[0]+[loc.expr[1] for stkElm in stkElms for loc in getStackLocations(stkElm)]))
-
 def generateDebugLabel(func):
     funElms  = len(func.parameters) + len(func.variables) + len(func.registers)
     inlinedStackElms = [getStackElements(inlined) for inlined in func.inlined_functions]
@@ -469,13 +474,11 @@ def generateDebugLabel(func):
         logging.info(f"Function {func.name} has {len(stkSlots)} stack elements out of {funElms} total.")
     logging.debug(f"{func.name} => [{', '.join(stkElm.name+'@ebp%+d'%getMaxStackOff(stkElm) for stkElm in stkSlots)}]")
     retaddr = getRegisterSize(func.arch)
-    return [retaddr] + [stkElm.type.byte_size for stkElm in stkSlots] #  if stkElm.type not in [Type._VOID, Type._VARIADIC]]
+    return [retaddr] + [stkElm.type.byte_size for stkElm in stkSlots]
 
 # FIXME for some reason Location.pc may be 0 for some local variables, even if line['pc'] is nonzero
 def getStackElements(function):
     '''return stack elements (in no particular order)'''
-    # TODO currently, we use 'cfa' as the return address element.. requires further testing (e.g., on ARM)
-    #regs = [reg for reg in function.registers if reg.number != 'cfa']
     candidates = function.parameters + function.variables + function.registers
     logging.debug(f"Function {function.name}@{function.start} has {len(candidates)} potential stack elements.")
     return [stkElm for stkElm in candidates if any(getStackLocations(stkElm))]
@@ -490,32 +493,9 @@ def getStackLocations(stkElm):
     return [loc for loc in stkElm.locations if locExprHasOffset(loc)]
 
 def locExprHasOffset(location): # TODO y0 d4wg, this sh!t is sketchy as f*&^
-    if location.type in [LocationType.STATIC_GLOBAL, LocationType.STATIC_LOCAL]:
+    if location.type in [LocationType.STATIC_GLOBAL, LocationType.STATIC_LOCAL]: # FIXME with LocationType.DYNAMIC we get 'None' sized objects on the stack
         return len(location.expr) > 1 and type(location.expr[1]) == int
     return False
-
-def checkLabels(functions):
-    logging.info(f"Start collecting labels for {len(functions)} functions..")
-    allLabels = {}
-    for func in functions:
-        if func.is_inline:
-            continue
-        frame = getMaxFrameSize(func)
-        label = generateDebugLabel(func)
-        maxCfa = getMaxFrameSizeCFA(func)
-        if any(True for slotSize in label if slotSize is None):
-            logging.warn(f"Function {func.name} has VOID or VARIADIC type stack objects; cannot determine frame size reliably!")
-            continue
-        if 8 < abs(sum(label)-frame): # off by more than 8 bytes
-            logging.warn(f"Label generation for {func.name} is not sound (got {frame} by offset, but {sum(label)} by size: {label})!")
-            #continue # TODO: previously, we included these in the training
-        logging.info(f"{func.name} ({frame} by offset / {sum(label)} by size) => {label}")
-        allLabels[func.name] = {}
-        allLabels[func.name]['inp'] = ' '.join([func.code[i:i+2] for i in range(0, len(func.code), 2)])
-        allLabels[func.name]['max'] = frame
-        allLabels[func.name]['out'] = label
-        allLabels[func.name]['maxCFA'] = maxCfa
-    return allLabels
 
 def collectOpcodes(func_dict, elf):
     '''pyelftools standalone opcode retrieval (should be fast)'''
@@ -546,6 +526,80 @@ def collectOpcodes(func_dict, elf):
         if func.code is None:
             logging.critical(f"Symbol {func.name}@{hex(func.start)} undefined, opcodes missing!")
     return func_dict
+
+def checkLabels(functions, want_analysis=False):
+    logging.info(f"Start collecting labels for {len(functions)} functions..")
+    allLabels = {}
+    for func in functions:
+        if not func.is_inline:
+            funclabel = dict()
+            funclabel['inp'] = ' '.join([func.code[i:i+2] for i in range(0, len(func.code), 2)])
+            funclabel['max'] = getMaxFrameSize(func)
+            funclabel['out'] = generateDebugLabel(func)
+            funclabel['maxCFA'] = getMaxFrameSizeCFA(func)
+            if want_analysis: # requires capstone
+                stack, maxstack = disassembleAndAnalyzeSymbolically(func)
+                funclabel['maxANA'] = maxstack
+                funclabel['outANA'] = stack[1:]
+                logging.debug(f"{func.name} ({funclabel['max']} / {sum(funclabel['out'])} / {funclabel['maxCFA']} / {funclabel['maxANA']}) => {funclabel['out']} / {funclabel['outANA']}")
+            else:
+                logging.debug(f"{func.name} ({funclabel['max']} / {sum(funclabel['out'])} / {funclabel['maxCFA']}) => {label}")
+            allLabels[func.name] = funclabel
+    return allLabels
+
+def disassembleAndAnalyzeSymbolically(func):
+    if func.arch == 'x64':
+        return disasAndAnalyzeStackAMD64(func)
+    elif func.arch == 'AArch64':
+        return disasAndAnalyzeStackAArch64(func)
+
+def disasAndAnalyzeStackAMD64(func):
+    import re; import capstone
+    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+    non_hexdigits = re.compile(r'[^\dx]+')
+    maxstack = 0
+    stack = [0]
+    for i in md.disasm(bytes.fromhex(func.code), func.start):
+        if i.mnemonic == 'push':
+            stack += [8]
+        elif i.mnemonic == 'pop':
+            stack += [-8]
+        elif 'rsp' in i.op_str or 'esp' in i.op_str:
+            if i.mnemonic == 'sub':
+                stack += [int(i.op_str.split(' ')[1], 16)]
+            elif i.mnemonic == 'add':
+                stack += [-int(i.op_str.split(' ')[1], 16)]
+            else:
+                raise RuntimeError(f"0x{hex(i.address)}:\t{i.mnemonic}\t{i.op_str}")
+        _sum  = sum(stack)
+        maxstack = _sum if maxstack < _sum else maxstack
+    return stack, maxstack
+
+def disasAndAnalyzeStackAArch64(func):
+    import re; import capstone
+    md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
+    md.detail = True
+    non_hexdigits = re.compile(r'[^\dx]+')
+    maxstack = 0
+    stack = [0]
+    for i in md.disasm(bytes.fromhex(func.code), func.start):
+        if 'sp' in i.op_str:
+            regs_read, regs_write = i.regs_access()
+            if 0 < len(regs_write) and 'sp' in [i.reg_name(r) for r in regs_write]:
+                split = i.op_str.split(' ')
+                if i.mnemonic == 'stp':
+                    stack += [int(non_hexdigits.sub('', split[3]), 16)]
+                elif i.mnemonic == 'ldp':
+                    stack += [-int(non_hexdigits.sub('', split[3]), 16)]
+                elif i.mnemonic in ['sub', 'str']:
+                    stack += [int(non_hexdigits.sub('', split[2]), 16)]
+                elif i.mnemonic in ['add', 'ldr']:
+                    stack += [-int(non_hexdigits.sub('', split[2]), 16)]
+                else:
+                    raise RuntimeError(f"0x{hex(i.address)}:\t{i.mnemonic}\t{i.op_str}")
+        _sum  = sum(stack)
+        maxstack = _sum if maxstack < _sum else maxstack
+    return stack, maxstack
 
 # TODO Unused. At the moment we're not using control flow to improve our heuristic stack frame measure..
 def isOnStack(variable):
