@@ -574,10 +574,10 @@ def disassembleAndAnalyzeSymbolically(func):
 
 def disasAndAnalyzeStackAMD64(func, m32=False):
     import re; import capstone
-    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32 if m32 else capstone.CS_MODE_64)
     non_hexdigits = re.compile(r'[^\dx]+')
     md.detail = True
-    regsize = 8 if not m32 else 4
+    regsize = getRegisterSize(func.arch)
     maxstack = 0
     stackops = []
     for i in md.disasm(bytes.fromhex(func.code), func.start):
