@@ -1,1 +1,0 @@
-{"deregister_tm_clones":8,"register_tm_clones":8,"LBM_allocateGrid":16,"LBM_freeGrid":16,"LBM_initializeGrid":0,"LBM_loadObstacleFile":48,"LBM_initializeSpecialCellsForChannel":0,"LBM_showGridStatistics":112,"MAIN_parseCommandLine":176,"MAIN_printInfo":240,"MAIN_initialize":16,"MAIN_finalize":16}
