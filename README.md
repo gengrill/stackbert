@@ -1,4 +1,4 @@
-Machine Learning for Runtime Stack Size Estimation
+Using Transformers to Statically Predict Stack Size Usage of Binary Code
 ---
 
 This is the repository containing the code for our ACM AISec'21 paper "StackBERT: Machine Learning Assisted Static Stack Frame Size Recovery on Stripped and Optimized Binaries". Our training sets and pretrained models are hosted on Google Drive.
